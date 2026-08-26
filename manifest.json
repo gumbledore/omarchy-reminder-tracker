@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "gumbledore.reminders",
+  "name": "Reminder Tracker",
+  "version": "1.0.0",
+  "author": "Kevin Goff",
+  "license": "MIT",
+  "description": "A persistent to-do list that also notifies. Reminders survive reboots and outlive firing.",
+  "kinds": [
+    "overlay",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "ReminderFlow.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Reminders",
+    "description": "Open and overdue reminder count; click to open the list.",
+    "category": "Status",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

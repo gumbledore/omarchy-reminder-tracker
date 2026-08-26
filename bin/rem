@@ -1,0 +1,417 @@
+#!/bin/bash
+#
+# rem - a persistent to-do list that can also notify.
+#
+# One record type: an item with optional due time. No due time is a plain
+# to-do; a due time makes it notify once. Firing never completes an item -
+# only `done` or `rm` takes it off the list. That is the whole point, and the
+# reason this exists alongside `omarchy reminder`, which fires and evaporates.
+#
+# This script is the ONLY writer of items.json. The overlay and the sweeper
+# shell out to it so locking lives in exactly one place.
+
+set -euo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rem"
+ITEMS="$STATE_DIR/items.json"
+LOCK="$STATE_DIR/.lock"
+GLYPH="󰢌"
+
+# A missed reminder older than this reads as "you were away" rather than "this
+# just fired", and gets the grouped catch-up notification instead of a toast.
+AWAY_THRESHOLD=300
+
+mkdir -p "$STATE_DIR"
+
+# --- store -------------------------------------------------------------------
+
+ensure_store() {
+  [[ -f $ITEMS ]] || echo '{"version":1,"nextId":1,"items":[],"archive":[]}' >"$ITEMS"
+}
+
+lock() {
+  exec 9>"$LOCK"
+  flock 9
+}
+
+# Apply a jq filter to the store and replace it atomically. Held under the lock
+# taken by the caller, so read-modify-write cannot interleave.
+apply() {
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/.items.XXXXXX")
+  if jq "$@" "$ITEMS" >"$tmp"; then
+    mv "$tmp" "$ITEMS"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# --- time --------------------------------------------------------------------
+
+# Resolve a natural-language expression to an epoch. GNU date already
+# understands "fri 2pm", "next tuesday 14:00", "2 weeks", "sep 3" - there is no
+# parser to write here. The expression is passed as a single argv element, so
+# arbitrary user text is never shell-evaluated.
+resolve_when() {
+  local expr="${1:-}"
+  [[ -z ${expr// /} ]] && return 1
+  date -d "$expr" +%s 2>/dev/null
+}
+
+# Durations for snooze: bare "2h" style shorthand, otherwise anything date -d
+# takes ("tomorrow 9am" is a legitimate snooze target).
+resolve_snooze() {
+  local expr="${1:-}"
+  if [[ $expr =~ ^([0-9]+)([smhdw])$ ]]; then
+    local n=${BASH_REMATCH[1]} unit=${BASH_REMATCH[2]}
+    case $unit in
+    s) expr="+$n seconds" ;;
+    m) expr="+$n minutes" ;;
+    h) expr="+$n hours" ;;
+    d) expr="+$n days" ;;
+    w) expr="+$n weeks" ;;
+    esac
+  fi
+  resolve_when "$expr"
+}
+
+when_text() { date -d "@$1" +'%a %-d %b %H:%M'; }
+
+# Coarse relative delta. Deliberately imprecise past a day - "in 3d" is the
+# useful fact, not "in 3d 4h 12m".
+human_delta() {
+  local s=$1 sign="in "
+  ((s < 0)) && {
+    sign=""
+    s=$((-s))
+  }
+  local out
+  if ((s < 60)); then out="${s}s"
+  elif ((s < 3600)); then out="$((s / 60))m"
+  elif ((s < 86400)); then out="$((s / 3600))h $(((s % 3600) / 60))m"
+  elif ((s < 604800)); then out="$((s / 86400))d $(((s % 86400) / 3600))h"
+  else out="$((s / 604800))w $(((s % 604800) / 86400))d"; fi
+  [[ -z $sign ]] && echo "$out ago" || echo "${sign}${out}"
+}
+
+# Split "text @ when" on the LAST " @ ". No delimiter means a plain to-do.
+split_input() {
+  local input="$1"
+  if [[ $input == *" @ "* ]]; then
+    ITEM_TEXT="${input%" @ "*}"
+    ITEM_WHEN="${input##*" @ "}"
+  else
+    ITEM_TEXT="$input"
+    ITEM_WHEN=""
+  fi
+}
+
+# --- notification ------------------------------------------------------------
+
+# Notifications only exist inside a running shell. Without one, the sweeper must
+# NOT mark items notified - it leaves them for the next sweep so the catch-up
+# path can group them once you are actually back.
+shell_running() { pgrep -x quickshell >/dev/null 2>&1; }
+
+notify() {
+  local title="$1" body="${2:-}"
+  omarchy-notification-send -g "$GLYPH" "$title" "$body" --exec rem show-overlay >/dev/null 2>&1 || true
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_add() {
+  local input="$*" due=null when_desc="no due time"
+  [[ -z ${input// /} ]] && {
+    echo "rem: nothing to add" >&2
+    return 1
+  }
+
+  split_input "$input"
+  if [[ -n $ITEM_WHEN ]]; then
+    if ! due=$(resolve_when "$ITEM_WHEN"); then
+      echo "rem: could not understand time \"$ITEM_WHEN\"" >&2
+      return 1
+    fi
+    when_desc="$(when_text "$due") ($(human_delta $((due - $(date +%s)))))"
+  fi
+
+  [[ -z ${ITEM_TEXT// /} ]] && {
+    echo "rem: an item needs text" >&2
+    return 1
+  }
+
+  lock
+  ensure_store
+  apply --arg text "$ITEM_TEXT" --argjson due "$due" --argjson now "$(date +%s)" '
+    .items += [{id: .nextId, text: $text, created: $now, due: $due, notified: false}]
+    | .nextId += 1
+  '
+  echo "added: $ITEM_TEXT — $when_desc"
+}
+
+# Sorted view: overdue first, then upcoming by due, then undated by age.
+sorted_items() {
+  jq -r --argjson now "$(date +%s)" '
+    .items
+    | map(. + {overdue: (.due != null and .due <= $now)})
+    | sort_by(if .overdue then 0 elif .due != null then 1 else 2 end,
+              (.due // .created))
+  ' "$ITEMS"
+}
+
+cmd_ls() {
+  ensure_store
+  local now
+  now=$(date +%s)
+
+  if [[ ${1:-} == "--json" ]]; then
+    sorted_items | jq -c --argjson now "$now" '
+      {
+        count: length,
+        overdue: (map(select(.overdue)) | length),
+        items: map({
+          id, text, due, overdue,
+          when: (if .due == null then "" else (.due | todate) end)
+        })
+      }
+      | . + {
+          active: (.count > 0),
+          tooltip: (if .count == 0 then "No reminders"
+                    elif .overdue > 0 then "\(.overdue) overdue, \(.count) open"
+                    else "\(.count) open" end)
+        }
+    '
+    return
+  fi
+
+  local id text due overdue any=0
+  while IFS=$'\t' read -r id text due overdue; do
+    any=1
+    if [[ $due == "null" ]]; then
+      printf '  %-3s %-9s %-18s %s\n' "$id" "-" "" "$text"
+    elif [[ $overdue == "true" ]]; then
+      printf '  %-3s %-9s %-18s %s\n' "$id" "OVERDUE" "$(when_text "$due")" "$text"
+    else
+      printf '  %-3s %-9s %-18s %s\n' "$id" "$(human_delta $((due - now)))" "$(when_text "$due")" "$text"
+    fi
+  done < <(sorted_items | jq -r '.[] | [.id, .text, (.due // "null"), .overdue] | @tsv')
+
+  ((any)) || echo "  nothing open"
+}
+
+# done and rm are the same move with a different outcome recorded, so that the
+# archive can answer "what did I finish" separately from "what did I abandon".
+close_items() {
+  local outcome="$1"
+  shift
+  [[ $# -eq 0 ]] && {
+    echo "rem: need at least one id" >&2
+    return 1
+  }
+
+  lock
+  ensure_store
+  local ids
+  ids=$(printf '%s\n' "$@" | jq -R 'tonumber?' | jq -sc .)
+
+  local before after
+  before=$(jq '.items | length' "$ITEMS")
+  apply --argjson ids "$ids" --arg outcome "$outcome" --argjson now "$(date +%s)" '
+    .archive += (.items | map(select(.id as $i | $ids | index($i)))
+                        | map(. + {closed: $now, outcome: $outcome}))
+    | .items |= map(select(.id as $i | ($ids | index($i)) | not))
+  '
+  after=$(jq '.items | length' "$ITEMS")
+  echo "$outcome: $((before - after)) item(s)"
+}
+
+cmd_snooze() {
+  local id="${1:-}" spec="${2:-}"
+  [[ -z $id || -z $spec ]] && {
+    echo "Usage: rem snooze <id> <duration>" >&2
+    return 1
+  }
+
+  local due
+  if ! due=$(resolve_snooze "$spec"); then
+    echo "rem: could not understand duration \"$spec\"" >&2
+    return 1
+  fi
+
+  lock
+  ensure_store
+  apply --argjson id "$id" --argjson due "$due" '
+    .items |= map(if .id == $id then . + {due: $due, notified: false} else . end)
+  '
+  echo "snoozed $id until $(when_text "$due")"
+}
+
+# Undo exists because Enter on a filtered list is one keystroke away from
+# completing the wrong thing.
+cmd_undo() {
+  lock
+  ensure_store
+  local last
+  last=$(jq -r '.archive | if length == 0 then "" else (sort_by(.closed) | last | .text) end' "$ITEMS")
+  [[ -z $last ]] && {
+    echo "rem: nothing to undo"
+    return 0
+  }
+
+  apply '
+    (.archive | sort_by(.closed) | last) as $item
+    | .items += [$item | del(.closed, .outcome)]
+    | .archive |= map(select(. != $item))
+  '
+  echo "restored: $last"
+}
+
+cmd_sweep() {
+  ensure_store
+  local now
+  now=$(date +%s)
+
+  local pending
+  pending=$(jq -c --argjson now "$now" '
+    [.items[] | select(.due != null and .notified != true and .due <= $now)]
+  ' "$ITEMS")
+
+  local count
+  count=$(jq 'length' <<<"$pending")
+  ((count == 0)) && return 0
+
+  # No shell means no notification. Leave everything unmarked and try again
+  # next minute - that is exactly how a multi-day absence turns into one
+  # grouped catch-up rather than a silent loss.
+  shell_running || return 0
+
+  local max_late
+  max_late=$(jq --argjson now "$now" 'map($now - .due) | max' <<<"$pending")
+
+  if ((count == 1 && max_late <= AWAY_THRESHOLD)); then
+    notify "Reminder" "$(jq -r '.[0].text' <<<"$pending")"
+  else
+    local body title
+    body=$(jq -r --argjson now "$now" \
+      '.[] | "• \(.text)"' <<<"$pending")
+    if ((max_late > AWAY_THRESHOLD)); then
+      title="$count reminder(s) came due while you were away"
+    else
+      title="$count reminders due"
+    fi
+    notify "$title" "$body"
+  fi
+
+  lock
+  apply --argjson now "$now" '
+    .items |= map(if (.due != null and .notified != true and .due <= $now)
+                  then . + {notified: true} else . end)
+  '
+}
+
+cmd_show() {
+  ensure_store
+  local body
+  body=$(cmd_ls)
+  notify "Reminders" "$body"
+}
+
+# Live preview for the overlay: resolve an expression without committing to it.
+cmd_parse() {
+  local input="$*"
+  split_input "$input"
+
+  if [[ -z $ITEM_WHEN ]]; then
+    jq -cn --arg text "$ITEM_TEXT" '{ok: true, dated: false, text: $text, preview: "no due time — to-do only"}'
+    return
+  fi
+
+  local due
+  if ! due=$(resolve_when "$ITEM_WHEN"); then
+    jq -cn --arg when "$ITEM_WHEN" '{ok: false, dated: true, preview: "can’t read “\($when)”"}'
+    return
+  fi
+
+  jq -cn --arg text "$ITEM_TEXT" --argjson due "$due" \
+    --arg preview "$(when_text "$due")  ($(human_delta $((due - $(date +%s)))))" \
+    '{ok: true, dated: true, text: $text, due: $due, preview: $preview}'
+}
+
+cmd_overlay() { omarchy-shell shell summon gumbledore.reminders "{}" >/dev/null 2>&1 || true; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  rem                          list open items
+  rem <minutes> [message]      quick timer (compatible with `omarchy reminder`)
+  rem add <text> [@ <when>]    add an item; no "@" means a to-do with no due time
+  rem ls [--json]              list
+  rem done <id>...             complete (archived, undoable)
+  rem rm <id>...               drop (archived as abandoned)
+  rem snooze <id> <duration>   push the due time out (2h, 3d, "tomorrow 9am")
+  rem undo                     restore the most recently closed item
+  rem show                     list as a notification
+  rem sweep                    fire anything due (called by the timer)
+  rem parse <text>             resolve "@ when" without adding (used by the overlay)
+
+Time expressions go straight to `date -d`: "fri 2pm", "next tuesday 14:00",
+"2 weeks", "sep 3", "tomorrow 9am".
+EOF
+}
+
+case ${1:-ls} in
+add)
+  shift
+  cmd_add "$@"
+  ;;
+ls | list)
+  shift || true
+  cmd_ls "${1:-}"
+  ;;
+done)
+  shift
+  close_items done "$@"
+  ;;
+rm | drop)
+  shift
+  close_items dropped "$@"
+  ;;
+snooze)
+  shift
+  cmd_snooze "$@"
+  ;;
+undo)
+  cmd_undo
+  ;;
+sweep)
+  cmd_sweep
+  ;;
+show)
+  cmd_show
+  ;;
+show-overlay)
+  cmd_overlay
+  ;;
+parse)
+  shift
+  cmd_parse "$@"
+  ;;
+-h | --help | help)
+  usage
+  ;;
+*)
+  # Bare minutes keeps the muscle memory from `omarchy reminder 15 "..."`.
+  if [[ ${1:-} =~ ^[0-9]+$ ]]; then
+    minutes=$1
+    shift || true
+    message="$*"
+    [[ -z $message ]] && message="Your $minutes minutes are up"
+    cmd_add "$message @ +$minutes minutes"
+  else
+    usage
+    exit 1
+  fi
+  ;;
+esac

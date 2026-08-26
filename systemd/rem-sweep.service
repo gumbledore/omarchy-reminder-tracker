@@ -1,0 +1,6 @@
+[Unit]
+Description=Fire any reminders that have come due
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/rem sweep

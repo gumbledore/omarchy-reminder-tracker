@@ -1,0 +1,14 @@
+[Unit]
+Description=Check for due reminders every minute
+
+[Timer]
+# OnCalendar (not a monotonic OnUnitActiveSec) because Persistent= only takes
+# effect on calendar timers. That is what makes a reminder survive a shutdown:
+# on the next boot systemd runs the sweep it missed, and `rem sweep` delivers
+# everything that came due in the gap as a single catch-up notification.
+OnCalendar=*:*:00
+Persistent=true
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
