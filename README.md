@@ -10,7 +10,7 @@ timer and the wrong one for anything you actually need to remember.
 This is the same idea with the storage fixed, plus the thing that falls out of
 fixing it for free: a to-do list.
 
-![Typing a reminder, with the due time resolved live](docs/preview-relative.png)
+![The reminder list: overdue first, then soonest, then undated](docs/list.png)
 
 ## The model
 
@@ -56,18 +56,34 @@ omarchy plugin disable omarchy.reminders
 ## Using it
 
 `SUPER+SHIFT+T` opens the list. The filter line is also the new-item field, so
-searching and adding are the same gesture.
+searching and adding are the same gesture — type to narrow the list, and if
+nothing matches, Enter creates what you typed instead.
 
-```
-┌─ Reminders ──────────────────────────────┐
-│ > cl                                     │
-│   Call the clinic               OVERDUE  │
-│   Clear the desk                         │
-└──────────────────────────────────────────┘
- Enter  done    Ctrl+Enter  snooze    Del  drop    Ctrl+Z  undo
-```
+Items sort the way you actually triage: **overdue first**, then by how soon
+they are due, then undated to-dos at the bottom.
 
-Type something nothing matches and Enter creates it instead.
+| key | |
+|---|---|
+| `↑` `↓` | move the selection |
+| `Enter` | complete the selected item (archived, undoable) |
+| `Ctrl+Enter` | snooze it — prompts for a duration |
+| `Del` | drop it |
+| `Ctrl+Z` | undo the last completion |
+| `Esc` | clear the filter, then close |
+
+### In the bar
+
+<img src="docs/bar-widget.png" alt="The bar widget showing an overdue count" align="right" width="150">
+
+The bar widget shows how many items are open, and turns the urgent colour when
+any of them are overdue. Click it to open the list.
+
+This matters because of the central decision: firing never completes an item,
+so a reminder you ignored has to keep nagging from *somewhere*. The
+notification is a one-shot nudge you are allowed to miss; the bar count is the
+thing that stays.
+
+<br clear="all">
 
 ### Scheduling
 
@@ -86,12 +102,16 @@ Clear the desk                     <- no "@" at all: a to-do, never fires
 The overlay resolves the expression **live as you type**, so you commit to a
 real timestamp rather than to your guess about how `date` will read it:
 
+![Typing a reminder, with the due time resolved live](docs/preview-relative.png)
+
+That is worth more than it sounds:
+
 ![A weekday with no time resolves to midnight](docs/preview-weekday.png)
 
-That matters more than it sounds. `@ friday` above is not wrong, but it means
-*Friday at 00:00* — `date -d` defaults to midnight when you give it a day and
-no time. Write `@ friday 2pm` if you meant the afternoon. The preview is there
-so you find that out before you commit, not at midnight.
+`@ friday` is not wrong, but it means *Friday at 00:00* — `date -d` defaults to
+midnight when you give it a day and no time. Write `@ friday 2pm` if you meant
+the afternoon. The preview exists so you learn that before you commit, rather
+than at midnight.
 
 Leave the `@` off entirely and you get a to-do with no due time, which never
 notifies and sits on the list until you deal with it:
