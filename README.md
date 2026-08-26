@@ -10,7 +10,7 @@ timer and the wrong one for anything you actually need to remember.
 This is the same idea with the storage fixed, plus the thing that falls out of
 fixing it for free: a to-do list.
 
-<!-- TODO: screenshot of the overlay and the bar widget -->
+![Typing a reminder, with the due time resolved live](docs/preview-relative.png)
 
 ## The model
 
@@ -72,16 +72,31 @@ Type something nothing matches and Enter creates it instead.
 ### Scheduling
 
 Everything after ` @ ` goes verbatim to GNU `date -d`, so you can write what
-you mean. The overlay resolves it live as you type, before you commit:
+you mean:
 
 ```
-Call the clinic @ fri 2pm          ↳ Fri 28 Aug, 14:00  (in 2 days)
+Call the clinic @ fri 2pm
 Renew the domain @ 2 weeks
 Standup @ tomorrow 9am
 Book flights @ next tuesday 14:00
 Pay the invoice @ sep 3
-Clear the desk                     ↳ no due time — to-do only
+Clear the desk                     <- no "@" at all: a to-do, never fires
 ```
+
+The overlay resolves the expression **live as you type**, so you commit to a
+real timestamp rather than to your guess about how `date` will read it:
+
+![A weekday with no time resolves to midnight](docs/preview-weekday.png)
+
+That matters more than it sounds. `@ friday` above is not wrong, but it means
+*Friday at 00:00* — `date -d` defaults to midnight when you give it a day and
+no time. Write `@ friday 2pm` if you meant the afternoon. The preview is there
+so you find that out before you commit, not at midnight.
+
+Leave the `@` off entirely and you get a to-do with no due time, which never
+notifies and sits on the list until you deal with it:
+
+![No due time makes a plain to-do](docs/preview-todo.png)
 
 ### CLI
 
