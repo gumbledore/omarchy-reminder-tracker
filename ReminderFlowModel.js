@@ -20,6 +20,31 @@ function isCreateIntent(filter) {
   return String(filter || "").indexOf(" @ ") !== -1
 }
 
+// Caps mirrored from `rem`. The list only ever renders items that pass this,
+// so a malformed or oversized record from the store cannot reach a Text.
+var MAX_ITEMS = 500
+var MAX_TEXT = 500
+
+function sanitizeItems(items) {
+  if (!Array.isArray(items)) return []
+  var out = []
+  for (var i = 0; i < items.length && out.length < MAX_ITEMS; i++) {
+    var it = items[i]
+    if (!it || typeof it !== "object") continue
+    var id = Number(it.id)
+    if (!isFinite(id)) continue
+    var due = (it.due === null || it.due === undefined) ? null : Number(it.due)
+    if (due !== null && !isFinite(due)) due = null
+    out.push({
+      id: id,
+      text: String(it.text === undefined || it.text === null ? "" : it.text).slice(0, MAX_TEXT),
+      due: due,
+      overdue: it.overdue === true
+    })
+  }
+  return out
+}
+
 function visibleItems(items, filter) {
   var list = Array.isArray(items) ? items : []
   if (isCreateIntent(filter)) return []
@@ -64,6 +89,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     matches: matches,
     isCreateIntent: isCreateIntent,
+    sanitizeItems: sanitizeItems,
     visibleItems: visibleItems,
     humanDelta: humanDelta,
     dueLabel: dueLabel,

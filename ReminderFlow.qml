@@ -27,6 +27,13 @@ Item {
   property string mode: "list"
   property int snoozeTargetId: -1
 
+  // Anything larger than this from `rem` is treated as garbage rather than
+  // handed to JSON.parse. The worst legitimate `ls --json` (500 items of 500
+  // four-byte characters plus framing) is a little over 1 MiB.
+  readonly property int maxOutputBytes: 4 * 1024 * 1024
+  // Mirrors MAX_INPUT in `rem`: the filter line is also what gets passed to it.
+  readonly property int maxFilterLength: 800
+
   property var items: []
   property int selectedIndex: 0
   property int nowSeconds: 0
@@ -92,10 +99,15 @@ Item {
     if (!listProc.running) listProc.running = true
   }
 
+  function parseOutput(raw) {
+    var text = String(raw || "")
+    if (text.length > root.maxOutputBytes) return ({})
+    try { return JSON.parse(text || "{}") } catch (e) { return ({}) }
+  }
+
   function applyList(raw) {
-    var data = ({})
-    try { data = JSON.parse(String(raw || "{}")) } catch (e) { data = ({}) }
-    root.items = Array.isArray(data.items) ? data.items : []
+    var data = root.parseOutput(raw)
+    root.items = ReminderFlowModel.sanitizeItems(data.items)
     root.nowSeconds = Math.floor(Date.now() / 1000)
     root.clampSelection()
   }
@@ -114,7 +126,7 @@ Item {
   }
 
   function setFilter(nextFilter) {
-    root.filterText = nextFilter
+    root.filterText = String(nextFilter).slice(0, root.maxFilterLength)
     root.selectedIndex = 0
     if (root.mode === "list") previewTimer.restart()
   }
@@ -191,9 +203,8 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var data = ({})
-        try { data = JSON.parse(String(text || "{}")) } catch (e) { data = ({}) }
-        root.createPreview = String(data.preview || "")
+        var data = root.parseOutput(text)
+        root.createPreview = String(data.preview || "").slice(0, 200)
         root.createValid = data.ok === true
       }
     }
@@ -311,6 +322,7 @@ Item {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             text: root.filterText || root.promptText
+            textFormat: Text.PlainText
             color: root.foreground
             opacity: root.filterText ? 1 : 0.58
             font.family: root.fontFamily
@@ -334,6 +346,7 @@ Item {
                  ? "↳ " + (root.createPreview || "…")
                  : (root.items.length === 0 ? "Nothing open. Type to add one." : ""))
             color: root.createValid || !root.canCreate ? root.foreground : Color.menu.text
+            textFormat: Text.PlainText
             opacity: 0.62
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -387,6 +400,7 @@ Item {
                 anchors.rightMargin: Style.space(8)
                 anchors.verticalCenter: parent.verticalCenter
                 text: row.modelData ? row.modelData.text : ""
+                textFormat: Text.PlainText
                 color: row.hasCursor ? root.selectedText : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -399,6 +413,7 @@ Item {
                 anchors.rightMargin: Style.space(10)
                 anchors.verticalCenter: parent.verticalCenter
                 text: row.dueText
+                textFormat: Text.PlainText
                 color: row.hasCursor ? root.selectedText : root.foreground
                 opacity: row.isOverdue ? 1 : 0.55
                 font.family: root.fontFamily
@@ -421,6 +436,7 @@ Item {
             text: root.canCreate
               ? "Enter  add    •    “text @ fri 2pm” to schedule"
               : "Enter  done    Ctrl+Enter  snooze    Del  drop    Ctrl+Z  undo"
+            textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.42
             font.family: root.fontFamily

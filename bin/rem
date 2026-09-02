@@ -9,43 +9,139 @@
 #
 # This script is the ONLY writer of items.json. The overlay and the sweeper
 # shell out to it so locking lives in exactly one place.
+#
+# State I/O is descriptor-anchored: the state directory is opened once on fd 9
+# and verified (real directory, owned by us, mode 700, reached without a
+# symlink); every later path goes through /dev/fd/9/ so a swap of the on-disk
+# directory after the check cannot redirect a read or a write. The store is
+# opened on fd 8 and checked the same way before a byte is parsed. The
+# directory fd is also the lock, so there is no lock file to race on.
 
 set -euo pipefail
+umask 077
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rem"
-ITEMS="$STATE_DIR/items.json"
-LOCK="$STATE_DIR/.lock"
 GLYPH="󰢌"
+
+# Hard caps. Anything past these is refused (input) or truncated (output), so
+# the store, the notification body and `ls --json` all stay bounded no matter
+# what is on disk.
+MAX_TEXT=500                  # characters of item text
+MAX_INPUT=800                 # characters of one add/parse/snooze argument
+MAX_ITEMS=500                 # open items
+MAX_ARCHIVE=200               # closed items kept for undo
+MAX_STORE_BYTES=$((2 * 1024 * 1024))
+MAX_NOTIFY_LINES=10
+MAX_ID_DIGITS=15
 
 # A missed reminder older than this reads as "you were away" rather than "this
 # just fired", and gets the grouped catch-up notification instead of a toast.
 AWAY_THRESHOLD=300
 
-mkdir -p "$STATE_DIR"
+die() {
+  echo "rem: $*" >&2
+  exit 1
+}
 
 # --- store -------------------------------------------------------------------
 
-ensure_store() {
-  [[ -f $ITEMS ]] || echo '{"version":1,"nextId":1,"items":[],"archive":[]}' >"$ITEMS"
+# Open the state directory on fd 9 and refuse anything that is not a private
+# directory of ours reached without a symlink. After this, DIR is a path that
+# resolves through the descriptor, not through the filesystem name.
+open_state_dir() {
+  [[ -e $STATE_DIR || -L $STATE_DIR ]] || mkdir -p -m 700 "$STATE_DIR"
+  exec 9<"$STATE_DIR" || die "cannot open $STATE_DIR"
+  local pathid fdid owner mode ftype
+  pathid=$(stat -c '%d:%i' "$STATE_DIR")
+  read -r fdid owner mode ftype < <(stat -Lc '%d:%i %u %a %F' /dev/fd/9)
+  [[ $pathid == "$fdid" ]] || die "$STATE_DIR is a symlink; refusing"
+  [[ $ftype == directory ]] || die "$STATE_DIR is not a directory"
+  [[ $owner == "$(id -u)" ]] || die "$STATE_DIR is not owned by you"
+  [[ $mode == 700 ]] || chmod 700 /dev/fd/9
+  DIR=/dev/fd/9
+  ITEMS="$DIR/items.json"
 }
 
-lock() {
-  exec 9>"$LOCK"
-  flock 9
+lock_shared() { flock -s 9; }
+lock_exclusive() { flock -x 9; }
+
+EMPTY_STORE='{"version":1,"nextId":1,"items":[],"archive":[]}'
+
+# Every command works on STORE, the validated content of items.json. A missing
+# file is an empty store; a file that is not a private regular file of ours,
+# is oversized, or does not parse as the schema is an error, never something
+# to silently overwrite.
+load_store() {
+  if [[ ! -e $ITEMS && ! -L $ITEMS ]]; then
+    STORE=$EMPTY_STORE
+    return
+  fi
+  # Type-check the name before opening: a FIFO would block the open itself,
+  # and inside an exclusive lock that hang would wedge every other caller.
+  [[ ! -L $ITEMS && -f $ITEMS ]] || die "items.json is not a regular file; refusing"
+  exec 8<"$ITEMS" || die "cannot open items.json"
+  local pathid fdid owner links size ftype
+  pathid=$(stat -c '%d:%i' "$ITEMS")
+  read -r fdid owner links size ftype < <(stat -Lc '%d:%i %u %h %s %F' /dev/fd/8)
+  [[ $pathid == "$fdid" ]] || die "items.json is a symlink; refusing"
+  [[ $ftype == "regular file" ]] || die "items.json is not a regular file"
+  [[ $owner == "$(id -u)" ]] || die "items.json is not owned by you"
+  [[ $links == 1 ]] || die "items.json has extra hard links; refusing"
+  ((size <= MAX_STORE_BYTES)) || die "items.json exceeds $MAX_STORE_BYTES bytes; refusing"
+  STORE=$(head -c "$MAX_STORE_BYTES" <&8)
+  exec 8<&-
+  validate_store <<<"$STORE" || die "items.json is corrupt or not in the expected shape; move it aside"
 }
 
-# Apply a jq filter to the store and replace it atomically. Held under the lock
-# taken by the caller, so read-modify-write cannot interleave.
+validate_store() {
+  jq -e '
+    def item: type == "object"
+      and (.id | type == "number")
+      and (.text | type == "string")
+      and (.created | type == "number")
+      and (.notified == null or (.notified | type == "boolean"))
+      and (.due == null or (.due | type == "number" and . >= 0 and . < 1099511627776));
+    type == "object"
+    and .version == 1
+    and (.nextId | type == "number")
+    and (.items | type == "array" and all(item))
+    and (.archive | type == "array" and all(item))
+  ' >/dev/null 2>&1
+}
+
+# Apply a jq filter to STORE and replace items.json atomically: private temp
+# file in the anchored directory, data synced, then rename. Held under the
+# exclusive lock taken by the caller, so read-modify-write cannot interleave.
 apply() {
   local tmp
-  tmp=$(mktemp "$STATE_DIR/.items.XXXXXX")
-  if jq "$@" "$ITEMS" >"$tmp"; then
-    mv "$tmp" "$ITEMS"
+  tmp=$(mktemp "$DIR/.items.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT
+  if jq "$@" <<<"$STORE" >"$tmp" && validate_store <"$tmp" \
+     && (($(stat -c %s "$tmp") <= MAX_STORE_BYTES)); then
+    sync -d "$tmp"
+    mv -T "$tmp" "$ITEMS"
+    STORE=$(<"$ITEMS")
   else
     rm -f "$tmp"
-    return 1
+    die "internal error: refusing to write an invalid store"
   fi
+  trap - EXIT
 }
+
+# --- input -------------------------------------------------------------------
+
+check_len() {
+  local what="$1" value="$2" max="$3"
+  ((${#value} <= max)) || die "$what is too long (max $max characters)"
+}
+
+check_id() {
+  [[ $1 =~ ^[0-9]+$ ]] && ((${#1} <= MAX_ID_DIGITS)) || die "\"$1\" is not an item id"
+}
+
+# Control characters never belong in an item: they would break the one-line
+# list view and the notification body.
+clean_text() { printf '%s' "${1//[[:cntrl:]]/ }"; }
 
 # --- time --------------------------------------------------------------------
 
@@ -54,16 +150,18 @@ apply() {
 # parser to write here. The expression is passed as a single argv element, so
 # arbitrary user text is never shell-evaluated.
 resolve_when() {
-  local expr="${1:-}"
+  local expr="${1:-}" out
   [[ -z ${expr// /} ]] && return 1
-  date -d "$expr" +%s 2>/dev/null
+  out=$(date -d "$expr" +%s 2>/dev/null) || return 1
+  [[ $out =~ ^[0-9]+$ ]] || return 1
+  echo "$out"
 }
 
 # Durations for snooze: bare "2h" style shorthand, otherwise anything date -d
 # takes ("tomorrow 9am" is a legitimate snooze target).
 resolve_snooze() {
   local expr="${1:-}"
-  if [[ $expr =~ ^([0-9]+)([smhdw])$ ]]; then
+  if [[ $expr =~ ^([0-9]{1,7})([smhdw])$ ]]; then
     local n=${BASH_REMATCH[1]} unit=${BASH_REMATCH[2]}
     case $unit in
     s) expr="+$n seconds" ;;
@@ -97,7 +195,8 @@ human_delta() {
 
 # Split "text @ when" on the LAST " @ ". No delimiter means a plain to-do.
 split_input() {
-  local input="$1"
+  local input
+  input=$(clean_text "$1")
   if [[ $input == *" @ "* ]]; then
     ITEM_TEXT="${input%" @ "*}"
     ITEM_WHEN="${input##*" @ "}"
@@ -112,38 +211,38 @@ split_input() {
 # Notifications only exist inside a running shell. Without one, the sweeper must
 # NOT mark items notified - it leaves them for the next sweep so the catch-up
 # path can group them once you are actually back.
-shell_running() { pgrep -x quickshell >/dev/null 2>&1; }
+shell_running() { pgrep -x quickshell >/dev/null 2>&1 9<&-; }
 
+# omarchy-notification-send takes the body positionally but still recognizes a
+# body that is exactly one of its flag words; a leading space keeps item text
+# like "--exec" or "-g" content rather than an option. fd 9 is the lock, and
+# the notification daemon may leave a detached child behind, so it is closed
+# for this call: nothing outside rem may ever hold the store lock.
 notify() {
   local title="$1" body="${2:-}"
-  omarchy-notification-send -g "$GLYPH" "$title" "$body" --exec rem show-overlay >/dev/null 2>&1 || true
+  [[ $body == -* ]] && body=" $body"
+  omarchy-notification-send -g "$GLYPH" "$title" "$body" --exec rem show-overlay >/dev/null 2>&1 9<&- || true
 }
 
 # --- commands ----------------------------------------------------------------
 
 cmd_add() {
   local input="$*" due=null when_desc="no due time"
-  [[ -z ${input// /} ]] && {
-    echo "rem: nothing to add" >&2
-    return 1
-  }
+  [[ -z ${input// /} ]] && die "nothing to add"
+  check_len "input" "$input" "$MAX_INPUT"
 
   split_input "$input"
   if [[ -n $ITEM_WHEN ]]; then
-    if ! due=$(resolve_when "$ITEM_WHEN"); then
-      echo "rem: could not understand time \"$ITEM_WHEN\"" >&2
-      return 1
-    fi
+    due=$(resolve_when "$ITEM_WHEN") || die "could not understand time \"$ITEM_WHEN\""
     when_desc="$(when_text "$due") ($(human_delta $((due - $(date +%s)))))"
   fi
 
-  [[ -z ${ITEM_TEXT// /} ]] && {
-    echo "rem: an item needs text" >&2
-    return 1
-  }
+  [[ -z ${ITEM_TEXT// /} ]] && die "an item needs text"
+  check_len "item text" "$ITEM_TEXT" "$MAX_TEXT"
 
-  lock
-  ensure_store
+  lock_exclusive
+  load_store
+  (($(jq '.items | length' <<<"$STORE") < MAX_ITEMS)) || die "list is full ($MAX_ITEMS items); finish something first"
   apply --arg text "$ITEM_TEXT" --argjson due "$due" --argjson now "$(date +%s)" '
     .items += [{id: .nextId, text: $text, created: $now, due: $due, notified: false}]
     | .nextId += 1
@@ -151,23 +250,26 @@ cmd_add() {
   echo "added: $ITEM_TEXT — $when_desc"
 }
 
-# Sorted view: overdue first, then upcoming by due, then undated by age.
+# Sorted view: overdue first, then upcoming by due, then undated by age. Text is
+# clipped and the list capped here so no consumer sees more than the limits.
 sorted_items() {
-  jq -r --argjson now "$(date +%s)" '
+  jq --argjson now "$(date +%s)" --argjson maxText "$MAX_TEXT" --argjson maxItems "$MAX_ITEMS" '
     .items
-    | map(. + {overdue: (.due != null and .due <= $now)})
+    | map(. + {overdue: (.due != null and .due <= $now), text: .text[:$maxText]})
     | sort_by(if .overdue then 0 elif .due != null then 1 else 2 end,
               (.due // .created))
-  ' "$ITEMS"
+    | .[:$maxItems]
+  ' <<<"$STORE"
 }
 
 cmd_ls() {
-  ensure_store
+  lock_shared
+  load_store
   local now
   now=$(date +%s)
 
   if [[ ${1:-} == "--json" ]]; then
-    sorted_items | jq -c --argjson now "$now" '
+    sorted_items | jq -c '
       {
         count: length,
         overdue: (map(select(.overdue)) | length),
@@ -203,27 +305,27 @@ cmd_ls() {
 
 # done and rm are the same move with a different outcome recorded, so that the
 # archive can answer "what did I finish" separately from "what did I abandon".
+# The archive is trimmed to the newest MAX_ARCHIVE on every close.
 close_items() {
   local outcome="$1"
   shift
-  [[ $# -eq 0 ]] && {
-    echo "rem: need at least one id" >&2
-    return 1
-  }
-
-  lock
-  ensure_store
+  [[ $# -eq 0 ]] && die "need at least one id"
+  local id
+  for id in "$@"; do check_id "$id"; done
   local ids
-  ids=$(printf '%s\n' "$@" | jq -R 'tonumber?' | jq -sc .)
+  ids=$(printf '%s\n' "$@" | jq -R 'tonumber' | jq -sc .)
 
+  lock_exclusive
+  load_store
   local before after
-  before=$(jq '.items | length' "$ITEMS")
-  apply --argjson ids "$ids" --arg outcome "$outcome" --argjson now "$(date +%s)" '
+  before=$(jq '.items | length' <<<"$STORE")
+  apply --argjson ids "$ids" --arg outcome "$outcome" --argjson now "$(date +%s)" --argjson maxArchive "$MAX_ARCHIVE" '
     .archive += (.items | map(select(.id as $i | $ids | index($i)))
                         | map(. + {closed: $now, outcome: $outcome}))
+    | .archive |= (sort_by(.closed) | .[-$maxArchive:])
     | .items |= map(select(.id as $i | ($ids | index($i)) | not))
   '
-  after=$(jq '.items | length' "$ITEMS")
+  after=$(jq '.items | length' <<<"$STORE")
   echo "$outcome: $((before - after)) item(s)"
 }
 
@@ -233,15 +335,14 @@ cmd_snooze() {
     echo "Usage: rem snooze <id> <duration>" >&2
     return 1
   }
+  check_id "$id"
+  check_len "duration" "$spec" "$MAX_INPUT"
 
   local due
-  if ! due=$(resolve_snooze "$spec"); then
-    echo "rem: could not understand duration \"$spec\"" >&2
-    return 1
-  fi
+  due=$(resolve_snooze "$spec") || die "could not understand duration \"$spec\""
 
-  lock
-  ensure_store
+  lock_exclusive
+  load_store
   apply --argjson id "$id" --argjson due "$due" '
     .items |= map(if .id == $id then . + {due: $due, notified: false} else . end)
   '
@@ -251,32 +352,35 @@ cmd_snooze() {
 # Undo exists because Enter on a filtered list is one keystroke away from
 # completing the wrong thing.
 cmd_undo() {
-  lock
-  ensure_store
+  lock_exclusive
+  load_store
   local last
-  last=$(jq -r '.archive | if length == 0 then "" else (sort_by(.closed) | last | .text) end' "$ITEMS")
+  last=$(jq -r '.archive | if length == 0 then "" else (sort_by(.closed) | last | .text) end' <<<"$STORE")
   [[ -z $last ]] && {
     echo "rem: nothing to undo"
     return 0
   }
+  (($(jq '.items | length' <<<"$STORE") < MAX_ITEMS)) || die "list is full ($MAX_ITEMS items); finish something first"
 
-  apply '
+  apply --argjson maxText "$MAX_TEXT" '
     (.archive | sort_by(.closed) | last) as $item
-    | .items += [$item | del(.closed, .outcome)]
+    | .items += [$item | del(.closed, .outcome) | .text |= .[:$maxText]]
     | .archive |= map(select(. != $item))
   '
   echo "restored: $last"
 }
 
 cmd_sweep() {
-  ensure_store
+  lock_shared
+  load_store
   local now
   now=$(date +%s)
 
   local pending
-  pending=$(jq -c --argjson now "$now" '
-    [.items[] | select(.due != null and .notified != true and .due <= $now)]
-  ' "$ITEMS")
+  pending=$(jq -c --argjson now "$now" --argjson maxText "$MAX_TEXT" '
+    [.items[] | select(.due != null and .notified != true and .due <= $now)
+              | .text |= .[:$maxText]]
+  ' <<<"$STORE")
 
   local count
   count=$(jq 'length' <<<"$pending")
@@ -294,8 +398,11 @@ cmd_sweep() {
     notify "Reminder" "$(jq -r '.[0].text' <<<"$pending")"
   else
     local body title
-    body=$(jq -r --argjson now "$now" \
-      '.[] | "• \(.text)"' <<<"$pending")
+    body=$(jq -r --argjson max "$MAX_NOTIFY_LINES" '
+      (.[:$max] | map("• \(.text)"))
+      + (if length > $max then ["…and \(length - $max) more"] else [] end)
+      | join("\n")
+    ' <<<"$pending")
     if ((max_late > AWAY_THRESHOLD)); then
       title="$count reminder(s) came due while you were away"
     else
@@ -304,7 +411,8 @@ cmd_sweep() {
     notify "$title" "$body"
   fi
 
-  lock
+  lock_exclusive
+  load_store
   apply --argjson now "$now" '
     .items |= map(if (.due != null and .notified != true and .due <= $now)
                   then . + {notified: true} else . end)
@@ -312,16 +420,28 @@ cmd_sweep() {
 }
 
 cmd_show() {
-  ensure_store
-  local body
+  local body total
   body=$(cmd_ls)
+  total=$(wc -l <<<"$body")
+  if ((total > MAX_NOTIFY_LINES)); then
+    body="$(head -n "$MAX_NOTIFY_LINES" <<<"$body")"$'\n'"  …and $((total - MAX_NOTIFY_LINES)) more"
+  fi
   notify "Reminders" "$body"
 }
 
 # Live preview for the overlay: resolve an expression without committing to it.
 cmd_parse() {
   local input="$*"
+  if ((${#input} > MAX_INPUT)); then
+    jq -cn --argjson max "$MAX_INPUT" '{ok: false, dated: false, preview: "too long (max \($max) characters)"}'
+    return
+  fi
   split_input "$input"
+
+  if ((${#ITEM_TEXT} > MAX_TEXT)); then
+    jq -cn --argjson max "$MAX_TEXT" '{ok: false, dated: false, preview: "too long (max \($max) characters)"}'
+    return
+  fi
 
   if [[ -z $ITEM_WHEN ]]; then
     jq -cn --arg text "$ITEM_TEXT" '{ok: true, dated: false, text: $text, preview: "no due time — to-do only"}'
@@ -360,6 +480,12 @@ Time expressions go straight to `date -d`: "fri 2pm", "next tuesday 14:00",
 "2 weeks", "sep 3", "tomorrow 9am".
 EOF
 }
+
+# Commands that touch the store open it first; parse, help and show-overlay
+# never need the state directory at all.
+case ${1:-ls} in
+add | ls | list | done | rm | drop | snooze | undo | sweep | show) open_state_dir ;;
+esac
 
 case ${1:-ls} in
 add)
@@ -403,11 +529,12 @@ parse)
   ;;
 *)
   # Bare minutes keeps the muscle memory from `omarchy reminder 15 "..."`.
-  if [[ ${1:-} =~ ^[0-9]+$ ]]; then
+  if [[ ${1:-} =~ ^[0-9]{1,7}$ ]]; then
     minutes=$1
     shift || true
     message="$*"
     [[ -z $message ]] && message="Your $minutes minutes are up"
+    open_state_dir
     cmd_add "$message @ +$minutes minutes"
   else
     usage
