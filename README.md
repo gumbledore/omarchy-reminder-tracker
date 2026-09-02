@@ -144,6 +144,18 @@ QML overlay and the sweeper shell out to `rem` rather than parsing the store
 themselves, so locking lives in exactly one place and the UI never displays
 state the store has not confirmed.
 
+That writer is careful about *what* it opens. The state directory is opened
+once and verified — a real directory, owned by you, mode `700`, reached
+without a symlink — and every read and write after that goes through the open
+descriptor rather than the path, so nothing can swap the directory out from
+under a running command. The store itself gets the same check (regular file,
+yours, one hard link, under 2 MiB) and a schema check before a byte of it is
+trusted; a store that fails is reported, never overwritten. Everything is
+bounded: 500 characters per item, 500 open items, the newest 200 closed items
+kept for undo, and notification bodies clipped to ten lines. The overlay
+renders all of it as plain text, so an item called `<b>` is an item called
+`<b>`.
+
 **The timer is `OnCalendar`, not monotonic.** `Persistent=true` only takes
 effect on calendar timers. That is precisely what makes a reminder survive a
 shutdown: systemd replays the sweep it missed while the machine was off.
@@ -157,6 +169,16 @@ does not complete anything.
 `rem sweep` sends nothing *and marks nothing as notified*, leaving the items for
 the next sweep. Without that guard, a reminder coming due during a shell
 restart would be silently consumed.
+
+## Tests
+
+```bash
+tests/run.sh
+```
+
+Exercises the CLI against a throwaway state directory: the round trip, the
+caps, and the refusals (symlinked directory, symlinked store, foreign file,
+corrupt JSON).
 
 ## Uninstall
 

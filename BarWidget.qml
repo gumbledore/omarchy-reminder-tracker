@@ -27,12 +27,23 @@ BarWidget {
     if (!jsonProc.running) jsonProc.running = true
   }
 
+  // Counts are clamped and the tooltip clipped: the bar renders nothing from
+  // the store that has not been reduced to a small number or a short string.
   function update(raw) {
+    var text = String(raw || "")
     var data = ({})
-    try { data = JSON.parse(String(raw || "{}")) } catch (e) { data = ({}) }
-    root.openCount = Number(data.count || 0)
-    root.overdueCount = Number(data.overdue || 0)
-    root.tooltip = String(data.tooltip || "Reminders")
+    if (text.length <= 4 * 1024 * 1024) {
+      try { data = JSON.parse(text || "{}") } catch (e) { data = ({}) }
+    }
+    root.openCount = clampCount(data.count)
+    root.overdueCount = clampCount(data.overdue)
+    root.tooltip = String(data.tooltip || "Reminders").slice(0, 80)
+  }
+
+  function clampCount(value) {
+    var n = Number(value)
+    if (!isFinite(n) || n < 0) return 0
+    return Math.min(Math.floor(n), 9999)
   }
 
   Component.onCompleted: refresh()
@@ -41,11 +52,12 @@ BarWidget {
   // the overlay, so a second handler on "gumbledore.reminders" is silently dropped
   // (and warns on every startup). Nothing needs to poke this widget anyway —
   // the two triggers below cover both reasons the count can change: the store
-  // was edited (file change), or time passed and something is now overdue.
-  // store was edited (file change), or time simply passed and something is now
-  // overdue (timer).
+  // was edited (file change), or time passed and something is now overdue
+  // (timer). preload is off so the shell only watches the path and never
+  // reads the store itself; `rem` is the one thing that parses it.
   FileView {
     path: root.itemsPath
+    preload: false
     watchChanges: true
     printErrors: false
     onFileChanged: root.refresh()

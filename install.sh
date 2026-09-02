@@ -20,14 +20,26 @@ say() { printf '  %s\n' "$*"; }
 
 command -v jq >/dev/null || { echo "install.sh: jq is required" >&2; exit 1; }
 
-mkdir -p "$BIN_DIR" "$UNIT_DIR" "$STATE_DIR"
+mkdir -p "$BIN_DIR" "$UNIT_DIR"
+# The store holds only your own text, but it is yours: private directory, and
+# `rem` refuses to use it if it is ever anything else.
+if [[ -L $STATE_DIR ]]; then
+  echo "install.sh: $STATE_DIR is a symlink; rem will refuse it. Remove it first" >&2
+  exit 1
+fi
+mkdir -p -m 700 "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+# Never clobber a real file with a symlink, whichever of ours it is.
+for target in "$BIN_DIR/rem" "$UNIT_DIR/rem-sweep.service" "$UNIT_DIR/rem-sweep.timer"; do
+  if [[ -e $target && ! -L $target ]]; then
+    echo "install.sh: $target exists and is not a symlink; move it aside first" >&2
+    exit 1
+  fi
+done
 
 # --- the CLI ---------------------------------------------------------------
 
-if [[ -e $BIN_DIR/rem && ! -L $BIN_DIR/rem ]]; then
-  echo "install.sh: $BIN_DIR/rem exists and is not a symlink; move it aside first" >&2
-  exit 1
-fi
 ln -sfn "$REPO_DIR/bin/rem" "$BIN_DIR/rem"
 say "linked $BIN_DIR/rem"
 
