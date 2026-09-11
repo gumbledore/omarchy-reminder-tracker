@@ -1,0 +1,11 @@
+{
+  "sandbox": {
+    "excludedCommands": [
+      "hyprctl*",
+      "notify-send*",
+      "omarchy-notification-send*",
+      "systemctl --user*",
+      "wl-copy*"
+    ]
+  }
+}
