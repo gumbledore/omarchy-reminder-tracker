@@ -115,7 +115,8 @@ chmod +x "$stub/fakeeditor"
 export EDITOR="$stub/fakeeditor --flag"
 check "add via editor, title only prefilled" 'FAKE_NOTE=$'"'"'Prefilled\n\nbody here\n'"'"' "$REM" note add "Prefilled" >/dev/null && [[ $("$REM" note ls --json | jq -r ".notes[] | select(.title == \"Prefilled\") | .body") == "body here" ]]'
 check "add via editor, no args" 'FAKE_NOTE=$'"'"'  Fresh  \n\nline\n\nmore\n\n'"'"' "$REM" note add >/dev/null && [[ $("$REM" note ls --json | jq -r ".notes[] | select(.title == \"Fresh\") | .body") == $'"'"'line\n\nmore'"'"' ]]'
-check "empty editor file cancels add" 'FAKE_NOTE="" "$REM" note add >/dev/null && [[ $("$REM" note ls --json | jq .count) == 5 ]]'
+check "second line without a blank is body, not title" 'FAKE_NOTE=$'"'"'Tight\nright under it'"'"' "$REM" note add >/dev/null && [[ $("$REM" note ls --json | jq -r ".notes[] | select(.title == \"Tight\") | .body") == "right under it" ]]'
+check "empty editor file cancels add" 'FAKE_NOTE="" "$REM" note add >/dev/null && [[ $("$REM" note ls --json | jq .count) == 6 ]]'
 check "edit via editor" 'FAKE_NOTE=$'"'"'Renamed\n\nnew body'"'"' "$REM" note edit 1 >/dev/null && [[ $("$REM" note show 1) == $'"'"'Renamed\n\nnew body'"'"' ]]'
 check "empty editor file leaves edit unchanged" 'FAKE_NOTE="" "$REM" note edit 1 >/dev/null && [[ $("$REM" note show 1) == $'"'"'Renamed\n\nnew body'"'"' ]]'
 check "editor failure leaves note unchanged" '! EDITOR="$stub/fakeeditor --wrong" "$REM" note edit 1 2>/dev/null && [[ $("$REM" note show 1) == $'"'"'Renamed\n\nnew body'"'"' ]]'

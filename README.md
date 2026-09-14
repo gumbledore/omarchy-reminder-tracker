@@ -108,13 +108,11 @@ rem note rm 3
 rem note ls --json              # machine-readable
 ```
 
-The editor file is the title, a blank line, then the body, like a commit
-message. Save it empty to cancel. `$EDITOR` is run through the shell, so a
-value with arguments works; if it is unset, `rem` says so rather than
-guessing. Omarchy's own `omarchy-launch-editor` detaches GUI editors and
-returns at once, so when that is your `$EDITOR`, `rem` resolves the Omarchy
-default editor itself and runs a GUI one (Zed, VS Code, Sublime) with
-`--wait`. Close the buffer or window and the note is saved.
+In the editor, the first line is the title and everything below it is the
+body; the blank line `rem` puts between them is dropped. Save it empty to
+cancel. `$EDITOR` is run through the shell, so
+Omarchy's own `omarchy-launch-editor --inline` works as-is; if it is unset,
+`rem` says so rather than guessing.
 
 ### In the bar
 
