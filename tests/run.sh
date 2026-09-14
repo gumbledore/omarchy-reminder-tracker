@@ -121,6 +121,13 @@ check "edit via editor" 'FAKE_NOTE=$'"'"'Renamed\n\nnew body'"'"' "$REM" note ed
 check "empty editor file leaves edit unchanged" 'FAKE_NOTE="" "$REM" note edit 1 >/dev/null && [[ $("$REM" note show 1) == $'"'"'Renamed\n\nnew body'"'"' ]]'
 check "editor failure leaves note unchanged" '! EDITOR="$stub/fakeeditor --wrong" "$REM" note edit 1 2>/dev/null && [[ $("$REM" note show 1) == $'"'"'Renamed\n\nnew body'"'"' ]]'
 check "no temp files left after editing" '[[ -z $(ls -A "$XDG_STATE_HOME/rem" | grep -v "^notes.json$") ]]'
+# Omarchy's launcher detaches GUI editors; rem must resolve the default itself
+# and run a GUI editor with --wait. The stub refuses to run without it.
+printf '#!/bin/bash\n[[ $1 == --wait ]] || exit 9\nprintf "%%s" "$FAKE_NOTE" >"$2"\n' >"$stub/zeditor"
+chmod +x "$stub/zeditor"
+mkdir -p "$XDG_STATE_HOME/omarchy/defaults"; echo zeditor >"$XDG_STATE_HOME/omarchy/defaults/editor"
+check "omarchy launcher resolves GUI editor with --wait" 'FAKE_NOTE=$'"'"'Via GUI\n\nwaited'"'"' PATH="$stub:$PATH" EDITOR="omarchy-launch-editor --inline" "$REM" note add >/dev/null && [[ $("$REM" note ls --json | jq -r ".notes[] | select(.title == \"Via GUI\") | .body") == waited ]]'
+rm -rf "$XDG_STATE_HOME/omarchy"
 unset EDITOR
 rm -f "$NOTES"
 for i in $(seq 50); do "$REM" note add "n$i" "b" >/dev/null; done

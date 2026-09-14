@@ -516,6 +516,32 @@ cmd_overlay() { omarchy-shell shell summon gumbledore.reminders "{}" >/dev/null 
 # works, the way git does it. Sets NOTE_TITLE and NOTE_BODY; returns 1 when the
 # file comes back empty, which is how you cancel. The lock fd is closed for the
 # editor, and the caller must not hold the lock while a human types.
+# omarchy-launch-editor detaches GUI editors and returns at once, which is
+# useless for a round trip: the file would be read and deleted before you
+# saved. So when $EDITOR is omarchy's launcher, resolve the default editor the
+# same way it does and, for the GUI ones, run it with --wait in the
+# foreground. Any other $EDITOR is run verbatim through the shell, like git.
+run_editor() {
+  local file="$1" first
+  read -r first _ <<<"$EDITOR"
+  if [[ ${first##*/} != omarchy-launch-editor ]]; then
+    sh -c "$EDITOR \"\$@\"" "$EDITOR" "$file" 9<&-
+    return
+  fi
+  local default="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/defaults/editor" editor=nvim
+  [[ -f $default ]] && read -r editor <"$default"
+  command -v "$editor" >/dev/null 2>&1 || editor=nvim
+  case ${editor##*/} in
+  zed | zeditor | code | codium | code-oss | subl | sublime_text | gedit) "$editor" --wait "$file" 9<&- ;;
+  *) "$editor" "$file" 9<&- ;;
+  esac
+}
+
+# Round-trip a note through $EDITOR: title on the first line, a blank line,
+# then the body, like a commit message. Sets NOTE_TITLE and NOTE_BODY; returns
+# 1 when the file comes back empty, which is how you cancel. The lock fd is
+# closed for the editor, and the caller must not hold the lock while a human
+# types.
 edit_note() {
   local title="$1" body="$2" dir file
   [[ -n ${EDITOR:-} ]] || die "set \$EDITOR to write notes from the command line"
@@ -527,7 +553,7 @@ edit_note() {
   else
     : >"$file"
   fi
-  sh -c "$EDITOR \"\$@\"" "$EDITOR" "$file" 9<&- || die "editor exited with an error; note unchanged"
+  run_editor "$file" || die "editor exited with an error; note unchanged"
   parse_note_file "$file"
   rm -rf "$dir"
   trap - EXIT
