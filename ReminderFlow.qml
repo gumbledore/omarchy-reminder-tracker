@@ -10,6 +10,11 @@ import "ReminderFlowModel.js" as ReminderFlowModel
 // box AND the new-item field, so seeing what is open and adding to it are the
 // same gesture. Nothing here writes items.json — every mutation goes through
 // `rem`, which is the only writer.
+//
+// Tab flips to the Notes tab: the same card, wider, with note titles down the
+// left and the selected note's body wrapped on the right. Notes are read here
+// and written in $EDITOR — Enter hands off to a terminal and the overlay gets
+// out of the way.
 Item {
   id: root
 
@@ -27,6 +32,10 @@ Item {
   property string mode: "list"
   property int snoozeTargetId: -1
 
+  // "reminders" or "notes". Always opens on reminders: triage first.
+  property string tab: "reminders"
+  readonly property bool onNotes: tab === "notes"
+
   // Anything larger than this from `rem` is treated as garbage rather than
   // handed to JSON.parse. The worst legitimate `ls --json` (500 items of 500
   // four-byte characters plus framing) is a little over 1 MiB.
@@ -40,11 +49,16 @@ Item {
   property string createPreview: ""
   property bool createValid: false
 
-  readonly property bool creating: ReminderFlowModel.isCreateIntent(filterText)
-  readonly property var visibleItems: ReminderFlowModel.visibleItems(items, filterText)
+  property var notes: []
+
+  readonly property bool creating: !onNotes && ReminderFlowModel.isCreateIntent(filterText)
+  readonly property var visibleItems: onNotes ? [] : ReminderFlowModel.visibleItems(items, filterText)
+  readonly property var visibleNotes: onNotes ? ReminderFlowModel.visibleNotes(notes, filterText) : []
+  readonly property int visibleCount: onNotes ? visibleNotes.length : visibleItems.length
   // Typing something no existing item matches is itself a create gesture — it
-  // saves an explicit "new item" key and reads naturally.
-  readonly property bool canCreate: creating || (filterText.length > 0 && visibleItems.length === 0)
+  // saves an explicit "new item" key and reads naturally. Same on the Notes
+  // tab, where the typed text becomes the new note's title.
+  readonly property bool canCreate: creating || (filterText.length > 0 && visibleCount === 0)
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -60,11 +74,15 @@ Item {
   readonly property int previewHeight: Style.space(20)
   readonly property int footerHeight: Style.space(20)
   readonly property int maxVisibleRows: 10
-  readonly property int listHeight: Math.max(rowHeight, Math.min(visibleItems.length, maxVisibleRows) * rowHeight)
+  readonly property int listHeight: onNotes
+    ? maxVisibleRows * rowHeight
+    : Math.max(rowHeight, Math.min(visibleItems.length, maxVisibleRows) * rowHeight)
+  readonly property int cardWidth: Style.space(onNotes ? 760 : 460)
+  readonly property int titleColumnWidth: Style.space(240)
 
   readonly property string promptText: root.mode === "snooze"
     ? "Snooze for… (2h, 3d, tomorrow 9am)"
-    : "Filter, or type a new item…"
+    : (root.onNotes ? "Filter notes, or type a title for a new one…" : "Filter, or type a new item…")
 
   function open(payloadJson) {
     var payload = ({})
@@ -73,6 +91,7 @@ Item {
 
     root.opened = true
     root.mode = "list"
+    root.tab = "reminders"
     root.snoozeTargetId = -1
     root.filterText = ""
     root.selectedIndex = 0
@@ -96,7 +115,19 @@ Item {
 
   function reload() {
     root.nowSeconds = Math.floor(Date.now() / 1000)
-    if (!listProc.running) listProc.running = true
+    if (root.onNotes) {
+      if (!notesProc.running) notesProc.running = true
+    } else if (!listProc.running) {
+      listProc.running = true
+    }
+  }
+
+  function switchTab() {
+    root.tab = root.onNotes ? "reminders" : "notes"
+    root.filterText = ""
+    root.createPreview = ""
+    root.selectedIndex = 0
+    root.reload()
   }
 
   function parseOutput(raw) {
@@ -112,8 +143,14 @@ Item {
     root.clampSelection()
   }
 
+  function applyNotes(raw) {
+    var data = root.parseOutput(raw)
+    root.notes = ReminderFlowModel.sanitizeNotes(data.notes)
+    root.clampSelection()
+  }
+
   function clampSelection() {
-    var count = root.visibleItems.length
+    var count = root.visibleCount
     if (count === 0) root.selectedIndex = 0
     else if (root.selectedIndex >= count) root.selectedIndex = count - 1
     else if (root.selectedIndex < 0) root.selectedIndex = 0
@@ -125,10 +162,41 @@ Item {
     return list[root.selectedIndex]
   }
 
+  function selectedNote() {
+    var list = root.visibleNotes
+    if (root.selectedIndex < 0 || root.selectedIndex >= list.length) return null
+    return list[root.selectedIndex]
+  }
+
   function setFilter(nextFilter) {
     root.filterText = String(nextFilter).slice(0, root.maxFilterLength)
     root.selectedIndex = 0
-    if (root.mode === "list") previewTimer.restart()
+    if (root.mode === "list" && !root.onNotes) previewTimer.restart()
+  }
+
+  // Writing a note is the editor's job. The overlay closes, a terminal opens
+  // on `rem note …`, and nothing reopens when the editor exits.
+  function handOffToEditor(args) {
+    root.dismiss()
+    Quickshell.execDetached(["omarchy-launch-terminal", root.remPath, "note"].concat(args))
+  }
+
+  function editSelectedNote() {
+    var note = root.selectedNote()
+    if (!note) return
+    root.handOffToEditor(["edit", String(note.id)])
+  }
+
+  function createNoteFromFilter() {
+    var title = root.filterText.trim()
+    if (!title) return
+    root.handOffToEditor(["add", title])
+  }
+
+  function removeSelectedNote() {
+    var note = root.selectedNote()
+    if (!note) return
+    root.run(["note", "rm", String(note.id)])
   }
 
   // Every mutation is a `rem` call followed by a reload, so the overlay never
@@ -177,6 +245,12 @@ Item {
 
   function submit() {
     if (root.mode === "snooze") { root.commitSnooze(); return }
+    if (root.onNotes) {
+      if (root.canCreate) root.createNoteFromFilter()
+      else if (root.visibleNotes.length === 0) root.dismiss()
+      else root.editSelectedNote()
+      return
+    }
     if (root.canCreate) { root.createFromFilter(); return }
     if (root.visibleItems.length === 0) { root.dismiss(); return }
     root.completeSelected()
@@ -188,6 +262,15 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyList(text)
+    }
+  }
+
+  Process {
+    id: notesProc
+    command: [root.remPath, "note", "ls", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyNotes(text)
     }
   }
 
@@ -250,7 +333,7 @@ Item {
 
     BorderSurface {
       id: card
-      width: Math.min(Style.space(460), panel.width - Style.gapsOut * 2)
+      width: Math.min(root.cardWidth, panel.width - Style.gapsOut * 2)
       height: Math.min(root.contentMargin * 2 + root.headerHeight + root.previewHeight
                        + (root.mode === "snooze" ? 0 : root.listHeight + root.footerHeight),
                        panel.height - Style.gapsOut * 2)
@@ -271,25 +354,31 @@ Item {
         Keys.onPressed: function (event) {
           var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
 
+          // Escape is a strict walk toward closed: prompt, filter, tab, gone.
           if (event.key === Qt.Key_Escape) {
             if (root.mode === "snooze") { root.mode = "list"; root.filterText = "" }
             else if (root.filterText) root.setFilter("")
+            else if (root.onNotes) root.switchTab()
             else root.dismiss()
             event.accepted = true
+          } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+            if (root.mode === "list") root.switchTab()
+            event.accepted = true
           } else if (event.key === Qt.Key_Down) {
-            root.selectedIndex = Math.min(root.selectedIndex + 1, root.visibleItems.length - 1)
+            root.selectedIndex = Math.max(0, Math.min(root.selectedIndex + 1, root.visibleCount - 1))
             event.accepted = true
           } else if (event.key === Qt.Key_Up) {
             root.selectedIndex = Math.max(root.selectedIndex - 1, 0)
             event.accepted = true
           } else if (ctrl && event.key === Qt.Key_Z) {
-            root.run(["undo"])
+            if (!root.onNotes) root.run(["undo"])
             event.accepted = true
           } else if (event.key === Qt.Key_Delete) {
-            root.dropSelected()
+            if (root.onNotes) root.removeSelectedNote()
+            else root.dropSelected()
             event.accepted = true
           } else if (ctrl && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
-            root.beginSnooze()
+            if (!root.onNotes) root.beginSnooze()
             event.accepted = true
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             root.submit()
@@ -342,9 +431,13 @@ Item {
             visible: text.length > 0
             text: root.mode === "snooze"
               ? "Enter to snooze, Esc to cancel"
-              : (root.canCreate
-                 ? "↳ " + (root.createPreview || "…")
-                 : (root.items.length === 0 ? "Nothing open. Type to add one." : ""))
+              : root.onNotes
+                ? (root.canCreate
+                   ? "↳ new note “" + root.filterText.trim() + "” — Enter opens your editor"
+                   : (root.notes.length === 0 ? "No notes. Type a title and press Enter." : ""))
+                : (root.canCreate
+                   ? "↳ " + (root.createPreview || "…")
+                   : (root.items.length === 0 ? "Nothing open. Type to add one." : ""))
             color: root.createValid || !root.canCreate ? root.foreground : Color.menu.text
             textFormat: Text.PlainText
             opacity: 0.62
@@ -360,8 +453,88 @@ Item {
           visible: root.mode !== "snooze"
           clip: true
 
+          // Notes: titles down the left, the selected body wrapped on the
+          // right. Both are plain text; a note titled <b> is titled <b>.
+          Item {
+            anchors.fill: parent
+            visible: root.onNotes
+
+            ListView {
+              id: noteList
+              anchors.left: parent.left
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              width: root.titleColumnWidth
+              model: root.visibleNotes
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              currentIndex: root.selectedIndex
+              highlightMoveDuration: 0
+              onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
+
+              delegate: BorderSurface {
+                id: noteRow
+                required property int index
+                required property var modelData
+
+                readonly property bool hasCursor: noteRow.index === root.selectedIndex
+
+                width: ListView.view.width
+                height: root.rowHeight
+                radius: root.cornerRadius
+                color: noteRow.hasCursor ? root.selectedBackground : "transparent"
+                borderSpec: noteRow.hasCursor ? root.borderSpec : Border.none()
+
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: root.selectedIndex = noteRow.index
+                }
+
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(10)
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: noteRow.modelData ? noteRow.modelData.id + "  " + noteRow.modelData.title : ""
+                  textFormat: Text.PlainText
+                  color: noteRow.hasCursor ? root.selectedText : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+              }
+            }
+
+            Flickable {
+              id: bodyPane
+              anchors.left: noteList.right
+              anchors.leftMargin: Style.space(12)
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              clip: true
+              contentWidth: width
+              contentHeight: bodyText.implicitHeight
+              boundsBehavior: Flickable.StopAtBounds
+              onContentHeightChanged: contentY = 0
+
+              Text {
+                id: bodyText
+                width: bodyPane.width
+                text: root.selectedNote() ? root.selectedNote().body : ""
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+            }
+          }
+
           ListView {
             id: resultList
+            visible: !root.onNotes
             anchors.fill: parent
             model: root.visibleItems
             clip: true
@@ -433,9 +606,13 @@ Item {
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: root.canCreate
-              ? "Enter  add    •    “text @ fri 2pm” to schedule"
-              : "Enter  done    Ctrl+Enter  snooze    Del  drop    Ctrl+Z  undo"
+            text: root.onNotes
+              ? (root.canCreate
+                 ? "Enter  new note    Tab  reminders"
+                 : "Enter  edit    Del  remove    Tab  reminders")
+              : (root.canCreate
+                 ? "Enter  add    •    “text @ fri 2pm” to schedule    Tab  notes"
+                 : "Enter  done    Ctrl+Enter  snooze    Del  drop    Ctrl+Z  undo    Tab  notes")
             textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.42
