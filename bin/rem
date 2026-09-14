@@ -510,8 +510,8 @@ cmd_overlay() { omarchy-shell shell summon gumbledore.reminders "{}" >/dev/null 
 
 # --- notes -------------------------------------------------------------------
 
-# Round-trip a note through $EDITOR: title on the first line, a blank line,
-# then the body, like a commit message. $EDITOR is run through the shell so a
+# Round-trip a note through $EDITOR: title on the first line, then the body
+# after a blank line. $EDITOR is run through the shell so a
 # value with arguments (omarchy's own is `omarchy-launch-editor --inline`)
 # works, the way git does it. Sets NOTE_TITLE and NOTE_BODY; returns 1 when the
 # file comes back empty, which is how you cancel. The lock fd is closed for the
@@ -534,16 +534,16 @@ edit_note() {
   [[ -n $NOTE_TITLE ]]
 }
 
-# Title is everything before the first blank line (flattened to one line);
-# body is everything after it, minus trailing newlines. A body with no title
-# line is not a note.
+# The first line is the title; everything after it is the body, minus the
+# blank line that separates them and any trailing newlines. Nothing about
+# where you leave blank lines can move text into the title.
 parse_note_file() {
   local content
-  # Read no more than one note could ever be; the caps are checked after.
   content=$(head -c $((MAX_NOTE_TITLE + MAX_NOTE_BODY + 16)) "$1")
-  if [[ $content == *$'\n\n'* ]]; then
-    NOTE_TITLE=${content%%$'\n\n'*}
-    NOTE_BODY=${content#*$'\n\n'}
+  if [[ $content == *$'\n'* ]]; then
+    NOTE_TITLE=${content%%$'\n'*}
+    NOTE_BODY=${content#*$'\n'}
+    NOTE_BODY=${NOTE_BODY#$'\n'}
   else
     NOTE_TITLE=$content
     NOTE_BODY=""
