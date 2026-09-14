@@ -92,6 +92,7 @@ check "count reported" '[[ $("$REM" note ls --json | jq .count) == 2 ]]'
 check "notes store is 600" '[[ $(stat -c %a "$NOTES") == 600 ]]'
 check "body keeps newlines" '[[ $("$REM" note ls --json | jq -r ".notes[1].body") == $'"'"'line one\nline two'"'"' ]]'
 check "show prints title, blank, body" '[[ $("$REM" note show 2) == $'"'"'Snippet\n\nline one\nline two'"'"' ]]'
+check "show, ls and ls --json agree" '[[ $("$REM" note show 2 | head -1) == Snippet && $("$REM" note ls | awk "\$1 == 2 {print \$NF}") == Snippet && $("$REM" note ls --json | jq -r ".notes[] | select(.id == 2) | .title") == Snippet && $("$REM" note ls --json | jq -r ".notes[] | select(.id == 2) | .body") == "$("$REM" note show 2 | tail -n +3)" ]]'
 check "ls lists in slot order" '[[ $("$REM" note ls | awk "{print \$1}" | tr "\n" " ") == "1 2 " ]]'
 check "ls shows titles" '[[ $("$REM" note ls) == *Wifi* && $("$REM" note) == *Snippet* ]]'
 "$REM" note rm 1 >/dev/null

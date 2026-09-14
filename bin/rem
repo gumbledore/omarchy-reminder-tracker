@@ -187,7 +187,7 @@ clean_text() { printf '%s' "${1//[[:cntrl:]]/ }"; }
 clean_body() { printf '%s' "$1" | tr -d '\000-\010\013-\037\177'; }
 
 check_slot() {
-  [[ $1 =~ ^[0-9]{1,2}$ ]] && (($1 >= 1 && $1 <= MAX_NOTES)) || die "\"$1\" is not a note number (1-$MAX_NOTES)"
+  [[ $1 =~ ^[0-9]{1,${#MAX_NOTES}}$ ]] && (($1 >= 1 && $1 <= MAX_NOTES)) || die "\"$1\" is not a note number (1-$MAX_NOTES)"
 }
 
 # --- time --------------------------------------------------------------------
@@ -539,7 +539,8 @@ edit_note() {
 # line is not a note.
 parse_note_file() {
   local content
-  content=$(head -c $((MAX_NOTES_BYTES)) "$1")
+  # Read no more than one note could ever be; the caps are checked after.
+  content=$(head -c $((MAX_NOTE_TITLE + MAX_NOTE_BODY + 16)) "$1")
   if [[ $content == *$'\n\n'* ]]; then
     NOTE_TITLE=${content%%$'\n\n'*}
     NOTE_BODY=${content#*$'\n\n'}

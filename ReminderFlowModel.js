@@ -68,7 +68,7 @@ function sanitizeNotes(notes) {
     var n = notes[i]
     if (!n || typeof n !== "object") continue
     var id = Number(n.id)
-    if (!isFinite(id) || id < 1) continue
+    if (!isFinite(id) || id < 1 || id > MAX_NOTES) continue
     out.push({
       id: id,
       title: String(n.title === undefined || n.title === null ? "" : n.title).slice(0, MAX_NOTE_TITLE),

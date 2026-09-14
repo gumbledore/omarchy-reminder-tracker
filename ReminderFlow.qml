@@ -438,7 +438,7 @@ Item {
                 : (root.canCreate
                    ? "↳ " + (root.createPreview || "…")
                    : (root.items.length === 0 ? "Nothing open. Type to add one." : ""))
-            color: root.createValid || !root.canCreate ? root.foreground : Color.menu.text
+            color: root.onNotes || root.createValid || !root.canCreate ? root.foreground : Color.menu.text
             textFormat: Text.PlainText
             opacity: 0.62
             font.family: root.fontFamily

@@ -10,6 +10,7 @@ const notes = m.sanitizeNotes([
   { id: "nope", title: "bad" },
   null,
   { id: 3, title: "t".repeat(300) },
+  { id: 51, title: "over the slot cap" },
 ])
 assert.equal(notes.length, 3)
 assert.equal(notes[0].body.length, 4000)
