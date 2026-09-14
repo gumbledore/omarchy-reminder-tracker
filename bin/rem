@@ -7,8 +7,12 @@
 # only `done` or `rm` takes it off the list. That is the whole point, and the
 # reason this exists alongside `omarchy reminder`, which fires and evaporates.
 #
-# This script is the ONLY writer of items.json. The overlay and the sweeper
-# shell out to it so locking lives in exactly one place.
+# `rem note` is a second, separate record: a titled sticky note that never
+# fires and is never completed. Notes live in their own file, notes.json, and
+# reminder commands never open it, so a bad note store cannot touch the list.
+#
+# This script is the ONLY writer of items.json and notes.json. The overlay and
+# the sweeper shell out to it so locking lives in exactly one place.
 #
 # State I/O is descriptor-anchored: the state directory is opened once on fd 9
 # and verified (real directory, owned by us, mode 700, reached without a
@@ -33,6 +37,11 @@ MAX_ARCHIVE=200               # closed items kept for undo
 MAX_STORE_BYTES=$((2 * 1024 * 1024))
 MAX_NOTIFY_LINES=10
 MAX_ID_DIGITS=15
+
+MAX_NOTES=50                  # notes; a note's id is its slot, 1..MAX_NOTES
+MAX_NOTE_TITLE=200            # characters of note title
+MAX_NOTE_BODY=4000            # characters of note body
+MAX_NOTES_BYTES=$((256 * 1024))
 
 # A missed reminder older than this reads as "you were away" rather than "this
 # just fired", and gets the grouped catch-up notification instead of a toast.
@@ -60,38 +69,50 @@ open_state_dir() {
   [[ $mode == 700 ]] || chmod 700 /dev/fd/9
   DIR=/dev/fd/9
   ITEMS="$DIR/items.json"
+  NOTES="$DIR/notes.json"
 }
 
 lock_shared() { flock -s 9; }
 lock_exclusive() { flock -x 9; }
+unlock() { flock -u 9; }
 
 EMPTY_STORE='{"version":1,"nextId":1,"items":[],"archive":[]}'
+EMPTY_NOTES='[]'
 
-# Every command works on STORE, the validated content of items.json. A missing
-# file is an empty store; a file that is not a private regular file of ours,
-# is oversized, or does not parse as the schema is an error, never something
-# to silently overwrite.
-load_store() {
-  if [[ ! -e $ITEMS && ! -L $ITEMS ]]; then
-    STORE=$EMPTY_STORE
+# Read one store file into the named variable. A missing file is the given
+# empty value; a file that is not a private regular file of ours, is
+# oversized, or does not parse as the schema is an error, never something to
+# silently overwrite.
+#   load_file <path> <max bytes> <validator> <empty> <varname>
+load_file() {
+  local path="$1" max="$2" validator="$3" empty="$4" name
+  local -n out="$5"
+  name=${path##*/}
+  if [[ ! -e $path && ! -L $path ]]; then
+    out=$empty
     return
   fi
   # Type-check the name before opening: a FIFO would block the open itself,
   # and inside an exclusive lock that hang would wedge every other caller.
-  [[ ! -L $ITEMS && -f $ITEMS ]] || die "items.json is not a regular file; refusing"
-  exec 8<"$ITEMS" || die "cannot open items.json"
+  [[ ! -L $path && -f $path ]] || die "$name is not a regular file; refusing"
+  exec 8<"$path" || die "cannot open $name"
   local pathid fdid owner links size ftype
-  pathid=$(stat -c '%d:%i' "$ITEMS")
+  pathid=$(stat -c '%d:%i' "$path")
   read -r fdid owner links size ftype < <(stat -Lc '%d:%i %u %h %s %F' /dev/fd/8)
-  [[ $pathid == "$fdid" ]] || die "items.json is a symlink; refusing"
-  [[ $ftype == "regular file" ]] || die "items.json is not a regular file"
-  [[ $owner == "$(id -u)" ]] || die "items.json is not owned by you"
-  [[ $links == 1 ]] || die "items.json has extra hard links; refusing"
-  ((size <= MAX_STORE_BYTES)) || die "items.json exceeds $MAX_STORE_BYTES bytes; refusing"
-  STORE=$(head -c "$MAX_STORE_BYTES" <&8)
+  [[ $pathid == "$fdid" ]] || die "$name is a symlink; refusing"
+  [[ $ftype == "regular file" ]] || die "$name is not a regular file"
+  [[ $owner == "$(id -u)" ]] || die "$name is not owned by you"
+  [[ $links == 1 ]] || die "$name has extra hard links; refusing"
+  ((size <= max)) || die "$name exceeds $max bytes; refusing"
+  out=$(head -c "$max" <&8)
   exec 8<&-
-  validate_store <<<"$STORE" || die "items.json is corrupt or not in the expected shape; move it aside"
+  "$validator" <<<"$out" || die "$name is corrupt or not in the expected shape; move it aside"
 }
+
+# Every reminder command works on STORE, the validated content of items.json.
+load_store() { load_file "$ITEMS" "$MAX_STORE_BYTES" validate_store "$EMPTY_STORE" STORE; }
+# Note commands work on NOTE_STORE, from notes.json. Nothing else loads it.
+load_notes() { load_file "$NOTES" "$MAX_NOTES_BYTES" validate_notes "$EMPTY_NOTES" NOTE_STORE; }
 
 validate_store() {
   jq -e '
@@ -109,24 +130,42 @@ validate_store() {
   ' >/dev/null 2>&1
 }
 
-# Apply a jq filter to STORE and replace items.json atomically: private temp
+validate_notes() {
+  jq -e --argjson max "$MAX_NOTES" '
+    def note: type == "object"
+      and (.id | type == "number" and . >= 1 and . <= $max)
+      and (.title | type == "string")
+      and (.body | type == "string")
+      and (.created | type == "number")
+      and (.updated | type == "number");
+    type == "array" and all(note) and length <= $max
+  ' >/dev/null 2>&1
+}
+
+# Apply a jq filter to a store and replace its file atomically: private temp
 # file in the anchored directory, data synced, then rename. Held under the
 # exclusive lock taken by the caller, so read-modify-write cannot interleave.
-apply() {
-  local tmp
-  tmp=$(mktemp "$DIR/.items.XXXXXX")
+#   write_file <path> <max bytes> <validator> <varname> <jq args...>
+write_file() {
+  local path="$1" max="$2" validator="$3" tmp
+  local -n store="$4"
+  shift 4
+  tmp=$(mktemp "$DIR/.${path##*/}.XXXXXX")
   trap 'rm -f "$tmp"' EXIT
-  if jq "$@" <<<"$STORE" >"$tmp" && validate_store <"$tmp" \
-     && (($(stat -c %s "$tmp") <= MAX_STORE_BYTES)); then
+  if jq "$@" <<<"$store" >"$tmp" && "$validator" <"$tmp" \
+     && (($(stat -c %s "$tmp") <= max)); then
     sync -d "$tmp"
-    mv -T "$tmp" "$ITEMS"
-    STORE=$(<"$ITEMS")
+    mv -T "$tmp" "$path"
+    store=$(<"$path")
   else
     rm -f "$tmp"
     die "internal error: refusing to write an invalid store"
   fi
   trap - EXIT
 }
+
+apply() { write_file "$ITEMS" "$MAX_STORE_BYTES" validate_store STORE "$@"; }
+apply_notes() { write_file "$NOTES" "$MAX_NOTES_BYTES" validate_notes NOTE_STORE "$@"; }
 
 # --- input -------------------------------------------------------------------
 
@@ -142,6 +181,14 @@ check_id() {
 # Control characters never belong in an item: they would break the one-line
 # list view and the notification body.
 clean_text() { printf '%s' "${1//[[:cntrl:]]/ }"; }
+
+# A note body is multi-line by design, so newline and tab stay; every other
+# control character goes.
+clean_body() { printf '%s' "$1" | tr -d '\000-\010\013-\037\177'; }
+
+check_slot() {
+  [[ $1 =~ ^[0-9]{1,${#MAX_NOTES}}$ ]] && (($1 >= 1 && $1 <= MAX_NOTES)) || die "\"$1\" is not a note number (1-$MAX_NOTES)"
+}
 
 # --- time --------------------------------------------------------------------
 
@@ -461,6 +508,165 @@ cmd_parse() {
 
 cmd_overlay() { omarchy-shell shell summon gumbledore.reminders "{}" >/dev/null 2>&1 || true; }
 
+# --- notes -------------------------------------------------------------------
+
+# Round-trip a note through $EDITOR: title on the first line, a blank line,
+# then the body, like a commit message. $EDITOR is run through the shell so a
+# value with arguments (omarchy's own is `omarchy-launch-editor --inline`)
+# works, the way git does it. Sets NOTE_TITLE and NOTE_BODY; returns 1 when the
+# file comes back empty, which is how you cancel. The lock fd is closed for the
+# editor, and the caller must not hold the lock while a human types.
+edit_note() {
+  local title="$1" body="$2" dir file
+  [[ -n ${EDITOR:-} ]] || die "set \$EDITOR to write notes from the command line"
+  dir=$(mktemp -d)
+  trap 'rm -rf "$dir"' EXIT
+  file="$dir/note.txt"
+  if [[ -n $title || -n $body ]]; then
+    printf '%s\n\n%s\n' "$title" "$body" >"$file"
+  else
+    : >"$file"
+  fi
+  sh -c "$EDITOR \"\$@\"" "$EDITOR" "$file" 9<&- || die "editor exited with an error; note unchanged"
+  parse_note_file "$file"
+  rm -rf "$dir"
+  trap - EXIT
+  [[ -n $NOTE_TITLE ]]
+}
+
+# Title is everything before the first blank line (flattened to one line);
+# body is everything after it, minus trailing newlines. A body with no title
+# line is not a note.
+parse_note_file() {
+  local content
+  # Read no more than one note could ever be; the caps are checked after.
+  content=$(head -c $((MAX_NOTE_TITLE + MAX_NOTE_BODY + 16)) "$1")
+  if [[ $content == *$'\n\n'* ]]; then
+    NOTE_TITLE=${content%%$'\n\n'*}
+    NOTE_BODY=${content#*$'\n\n'}
+  else
+    NOTE_TITLE=$content
+    NOTE_BODY=""
+  fi
+  NOTE_TITLE=$(clean_text "$NOTE_TITLE")
+  NOTE_TITLE="${NOTE_TITLE#"${NOTE_TITLE%%[![:space:]]*}"}"
+  NOTE_TITLE="${NOTE_TITLE%"${NOTE_TITLE##*[![:space:]]}"}"
+  NOTE_BODY=$(clean_body "$NOTE_BODY")
+}
+
+check_note() {
+  [[ -n ${NOTE_TITLE// /} ]] || die "a note needs a title"
+  check_len "note title" "$NOTE_TITLE" "$MAX_NOTE_TITLE"
+  check_len "note body" "$NOTE_BODY" "$MAX_NOTE_BODY"
+}
+
+# Slot order, with title and body clipped so no consumer sees past the caps.
+sorted_notes() {
+  jq --argjson maxTitle "$MAX_NOTE_TITLE" --argjson maxBody "$MAX_NOTE_BODY" '
+    sort_by(.id) | map(. + {title: .title[:$maxTitle], body: .body[:$maxBody]})
+  ' <<<"$NOTE_STORE"
+}
+
+cmd_note_ls() {
+  lock_shared
+  load_notes
+  if [[ ${1:-} == "--json" ]]; then
+    sorted_notes | jq -c '{count: length, notes: map({id, title, body, created, updated})}'
+    return
+  fi
+  local id updated title any=0
+  while IFS=$'\t' read -r id updated title; do
+    any=1
+    printf '  %-3s %-18s %s\n' "$id" "$(when_text "$updated")" "$title"
+  done < <(sorted_notes | jq -r '.[] | [.id, .updated, .title] | @tsv')
+  ((any)) || echo "  no notes"
+}
+
+# No args: editor, empty file. Title only: editor with the title filled in.
+# Title and body: written as given, no editor - the form scripts use.
+cmd_note_add() {
+  (($# <= 2)) || die "usage: rem note add [title] [body]"
+  if (($# == 2)); then
+    NOTE_TITLE=$(clean_text "$1")
+    NOTE_BODY=$(clean_body "$2")
+  else
+    check_len "note title" "${1:-}" "$MAX_NOTE_TITLE"
+    edit_note "$(clean_text "${1:-}")" "" || { echo "rem: empty note, nothing added"; return 0; }
+  fi
+  check_note
+
+  lock_exclusive
+  load_notes
+  (($(jq 'length' <<<"$NOTE_STORE") < MAX_NOTES)) || die "you have $MAX_NOTES notes, which is the limit; remove one first"
+  apply_notes --arg title "$NOTE_TITLE" --arg body "$NOTE_BODY" --argjson now "$(date +%s)" --argjson max "$MAX_NOTES" '
+    (([range(1; $max + 1)] - map(.id)) | first) as $slot
+    | . + [{id: $slot, title: $title, body: $body, created: $now, updated: $now}]
+    | sort_by(.id)
+  '
+  echo "added note $(jq -r --arg t "$NOTE_TITLE" 'map(select(.title == $t)) | max_by(.created) | .id' <<<"$NOTE_STORE"): $NOTE_TITLE"
+}
+
+note_json() {
+  jq -e --argjson id "$1" 'map(select(.id == $id)) | first // empty' <<<"$NOTE_STORE" \
+    || die "no note in slot $1"
+}
+
+cmd_note_edit() {
+  local id="${1:-}"
+  [[ -n $id ]] || die "usage: rem note edit <n>"
+  check_slot "$id"
+  [[ -n ${EDITOR:-} ]] || die "set \$EDITOR to write notes from the command line"
+
+  lock_shared
+  load_notes
+  local current
+  current=$(note_json "$id")
+  unlock
+  edit_note "$(jq -r .title <<<"$current")" "$(jq -r .body <<<"$current")" \
+    || { echo "rem: empty file, note $id unchanged"; return 0; }
+  check_note
+
+  lock_exclusive
+  load_notes
+  note_json "$id" >/dev/null
+  apply_notes --argjson id "$id" --arg title "$NOTE_TITLE" --arg body "$NOTE_BODY" --argjson now "$(date +%s)" '
+    map(if .id == $id then . + {title: $title, body: $body, updated: $now} else . end)
+  '
+  echo "updated note $id: $NOTE_TITLE"
+}
+
+cmd_note_show() {
+  local id="${1:-}"
+  [[ -n $id ]] || die "usage: rem note show <n>"
+  check_slot "$id"
+  lock_shared
+  load_notes
+  note_json "$id" | jq -r --argjson maxTitle "$MAX_NOTE_TITLE" --argjson maxBody "$MAX_NOTE_BODY" \
+    '"\(.title[:$maxTitle])\n\n\(.body[:$maxBody])"'
+}
+
+cmd_note_rm() {
+  local id="${1:-}"
+  [[ -n $id ]] || die "usage: rem note rm <n>"
+  check_slot "$id"
+  lock_exclusive
+  load_notes
+  note_json "$id" >/dev/null
+  apply_notes --argjson id "$id" 'map(select(.id != $id))'
+  echo "removed note $id"
+}
+
+cmd_note() {
+  case ${1:-ls} in
+  ls | list) shift || true; cmd_note_ls "${1:-}" ;;
+  add) shift; cmd_note_add "$@" ;;
+  edit) shift; cmd_note_edit "$@" ;;
+  show) shift; cmd_note_show "$@" ;;
+  rm | drop) shift; cmd_note_rm "$@" ;;
+  *) die "unknown note command \"$1\" (ls, add, edit, show, rm)" ;;
+  esac
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -476,6 +682,15 @@ Usage:
   rem sweep                    fire anything due (called by the timer)
   rem parse <text>             resolve "@ when" without adding (used by the overlay)
 
+  rem note                     list notes (slot, last edited, title)
+  rem note add [title] [body]  new note; fewer than two arguments opens $EDITOR
+  rem note edit <n>            open note <n> in $EDITOR
+  rem note show <n>            print note <n>
+  rem note rm <n>              remove note <n>; the slot is reused
+  rem note ls --json           machine-readable
+
+Notes are numbered 1-50 by slot; a new note takes the lowest free slot.
+
 Time expressions go straight to `date -d`: "fri 2pm", "next tuesday 14:00",
 "2 weeks", "sep 3", "tomorrow 9am".
 EOF
@@ -484,7 +699,7 @@ EOF
 # Commands that touch the store open it first; parse, help and show-overlay
 # never need the state directory at all.
 case ${1:-ls} in
-add | ls | list | done | rm | drop | snooze | undo | sweep | show) open_state_dir ;;
+add | ls | list | done | rm | drop | snooze | undo | sweep | show | note) open_state_dir ;;
 esac
 
 case ${1:-ls} in
@@ -523,6 +738,10 @@ show-overlay)
 parse)
   shift
   cmd_parse "$@"
+  ;;
+note)
+  shift
+  cmd_note "$@"
   ;;
 -h | --help | help)
   usage

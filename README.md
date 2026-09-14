@@ -70,6 +70,48 @@ they are due, then undated to-dos at the bottom.
 | `Del` | drop it |
 | `Ctrl+Z` | undo the last completion |
 | `Esc` | clear the filter, then close |
+| `Tab` | switch to notes |
+
+### Notes
+
+Some text is not a task: a phone number, a snippet, the wifi password. Shoved
+into a to-do it gets one truncated line and an accidental Enter archives it.
+So there is a second record type, the **note** — a title and a multi-line
+body that never fires and is never "done".
+
+`Tab` flips the same overlay to the Notes tab. Titles run down the left, the
+selected note's body is wrapped on the right, and the filter line searches
+both. Notes are read here and written in `$EDITOR`: `Enter` closes the
+overlay and opens the note in a terminal, and nothing pops back up when you
+are finished.
+
+| key | |
+|---|---|
+| `↑` `↓` | select a note |
+| `Enter` | edit it in `$EDITOR` — or, if nothing matches what you typed, create a note with that title |
+| `Del` | remove it |
+| `Tab` | back to reminders |
+| `Esc` | clear the filter, then back to reminders, then close |
+
+Every note has a number from 1 to 50. That number is its slot, not a
+history: a new note takes the lowest free one, and removing note 3 means the
+next note is note 3. Fifty notes, 200 characters of title, 4,000 of body.
+
+```bash
+rem note                        # list notes: slot, last edited, title
+rem note add                    # $EDITOR, empty file
+rem note add "Wifi"             # $EDITOR, title filled in
+rem note add "Wifi" "hunter2"   # no editor
+rem note edit 3
+rem note show 3                 # title, blank line, body
+rem note rm 3
+rem note ls --json              # machine-readable
+```
+
+The editor file is the title, a blank line, then the body, like a commit
+message. Save it empty to cancel. `$EDITOR` is run through the shell, so
+Omarchy's own `omarchy-launch-editor --inline` works as-is; if it is unset,
+`rem` says so rather than guessing.
 
 ### In the bar
 
@@ -142,7 +184,9 @@ before you trust this with anything.
 and `rem` is the only thing that writes it — `flock`, write-temp, rename. The
 QML overlay and the sweeper shell out to `rem` rather than parsing the store
 themselves, so locking lives in exactly one place and the UI never displays
-state the store has not confirmed.
+state the store has not confirmed. Notes get the same treatment in a sibling
+`notes.json` that no reminder command ever opens, so a broken note store
+cannot take the list down with it.
 
 That writer is careful about *what* it opens. The state directory is opened
 once and verified — a real directory, owned by you, mode `700`, reached
@@ -152,9 +196,9 @@ under a running command. The store itself gets the same check (regular file,
 yours, one hard link, under 2 MiB) and a schema check before a byte of it is
 trusted; a store that fails is reported, never overwritten. Everything is
 bounded: 500 characters per item, 500 open items, the newest 200 closed items
-kept for undo, and notification bodies clipped to ten lines. The overlay
-renders all of it as plain text, so an item called `<b>` is an item called
-`<b>`.
+kept for undo, notification bodies clipped to ten lines, and notes at 50 of
+them under 256 KiB. The overlay renders all of it as plain text, so an item
+called `<b>` is an item called `<b>`.
 
 **The timer is `OnCalendar`, not monotonic.** `Persistent=true` only takes
 effect on calendar timers. That is precisely what makes a reminder survive a
@@ -178,7 +222,9 @@ tests/run.sh
 
 Exercises the CLI against a throwaway state directory: the round trip, the
 caps, and the refusals (symlinked directory, symlinked store, foreign file,
-corrupt JSON).
+corrupt JSON), for reminders and for notes — the editor round trip runs
+against a scripted `$EDITOR`. If `node` is present it also runs the pure
+model helpers the overlay filters with.
 
 ## Uninstall
 
@@ -189,8 +235,8 @@ systemctl --user daemon-reload
 omarchy plugin remove gumbledore.reminders
 ```
 
-Your items stay at `~/.local/state/rem/items.json`; delete it if you want them
-gone.
+Your items stay at `~/.local/state/rem/items.json` and your notes at
+`notes.json` beside it; delete them if you want them gone.
 
 ## Not included
 
@@ -198,6 +244,10 @@ No recurrence, tags, priorities, or sync. Each of those reopens decisions this
 design closes cleanly — recurrence in particular changes what "done" means and
 what happens to occurrences you slept through. Deliberately left out until the
 simple version has earned it.
+
+Notes have no undo and no rich text. A note is reference text you edit in a
+real editor; an archive of deleted notes and a markdown renderer are each a
+second product.
 
 ## License
 

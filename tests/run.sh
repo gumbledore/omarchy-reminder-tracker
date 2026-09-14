@@ -81,6 +81,86 @@ rm -f "$XDG_STATE_HOME/rem"; mkdir -m 755 "$XDG_STATE_HOME/rem"
 check "lax dir mode tightened" '[[ $(stat -c %a "$XDG_STATE_HOME/rem") == 700 ]]'
 check "parse never creates state" 'rm -rf "$XDG_STATE_HOME"; "$REM" parse "a @ tomorrow" >/dev/null; [[ ! -e $XDG_STATE_HOME ]]'
 
+echo "notes"
+rm -rf "$XDG_STATE_HOME"
+NOTES="$XDG_STATE_HOME/rem/notes.json"
+"$REM" note add "Wifi" "pw: hunter2" >/dev/null
+"$REM" note add "Snippet" $'line one\nline two' >/dev/null
+check "first note takes slot 1" '[[ $("$REM" note ls --json | jq ".notes[0].id") == 1 ]]'
+check "second note takes slot 2" '[[ $("$REM" note ls --json | jq ".notes[1].id") == 2 ]]'
+check "count reported" '[[ $("$REM" note ls --json | jq .count) == 2 ]]'
+check "notes store is 600" '[[ $(stat -c %a "$NOTES") == 600 ]]'
+check "body keeps newlines" '[[ $("$REM" note ls --json | jq -r ".notes[1].body") == $'"'"'line one\nline two'"'"' ]]'
+check "show prints title, blank, body" '[[ $("$REM" note show 2) == $'"'"'Snippet\n\nline one\nline two'"'"' ]]'
+check "show, ls and ls --json agree" '[[ $("$REM" note show 2 | head -1) == Snippet && $("$REM" note ls | awk "\$1 == 2 {print \$NF}") == Snippet && $("$REM" note ls --json | jq -r ".notes[] | select(.id == 2) | .title") == Snippet && $("$REM" note ls --json | jq -r ".notes[] | select(.id == 2) | .body") == "$("$REM" note show 2 | tail -n +3)" ]]'
+check "ls lists in slot order" '[[ $("$REM" note ls | awk "{print \$1}" | tr "\n" " ") == "1 2 " ]]'
+check "ls shows titles" '[[ $("$REM" note ls) == *Wifi* && $("$REM" note) == *Snippet* ]]'
+"$REM" note rm 1 >/dev/null
+check "rm frees the slot" '[[ $("$REM" note ls --json | jq .count) == 1 ]]'
+"$REM" note add "Again" "x" >/dev/null
+check "add reuses lowest free slot" '[[ $("$REM" note ls --json | jq -r ".notes[] | select(.title == \"Again\") | .id") == 1 ]]'
+check "rm of empty slot refused" '! "$REM" note rm 7 2>/dev/null'
+check "bad slot refused" '! "$REM" note rm 0 2>/dev/null && ! "$REM" note show 51 2>/dev/null && ! "$REM" note show abc 2>/dev/null'
+check "title over 200 refused" '! "$REM" note add "$(head -c 201 /dev/zero | tr "\0" t)" "b" 2>/dev/null'
+check "body over 4000 refused" '! "$REM" note add "t" "$(head -c 4001 /dev/zero | tr "\0" b)" 2>/dev/null'
+check "title control chars cleaned" '"$REM" note add "$(printf "a\tb")" "c" >/dev/null && "$REM" note ls --json | jq -e ".notes[] | select(.title == \"a b\")" >/dev/null'
+check "empty title refused" '! "$REM" note add "" "body" 2>/dev/null'
+check "add without EDITOR and one arg fails" '! env -u EDITOR "$REM" note add "only title" 2>"$tmp/err" && grep -q "set \$EDITOR" "$tmp/err"'
+check "add without EDITOR and no args fails" '! EDITOR= "$REM" note add 2>"$tmp/err" && grep -q "set \$EDITOR" "$tmp/err"'
+check "edit without EDITOR fails" '! env -u EDITOR "$REM" note edit 1 2>"$tmp/err" && grep -q "set \$EDITOR" "$tmp/err"'
+# A scripted editor stands in for a human: it rewrites the file it is handed.
+# Its argument proves $EDITOR is word-split like git does it.
+printf '#!/bin/bash\n[[ $1 == --flag ]] || exit 9\nprintf "%%s" "$FAKE_NOTE" >"$2"\n' >"$stub/fakeeditor"
+chmod +x "$stub/fakeeditor"
+export EDITOR="$stub/fakeeditor --flag"
+check "add via editor, title only prefilled" 'FAKE_NOTE=$'"'"'Prefilled\n\nbody here\n'"'"' "$REM" note add "Prefilled" >/dev/null && [[ $("$REM" note ls --json | jq -r ".notes[] | select(.title == \"Prefilled\") | .body") == "body here" ]]'
+check "add via editor, no args" 'FAKE_NOTE=$'"'"'  Fresh  \n\nline\n\nmore\n\n'"'"' "$REM" note add >/dev/null && [[ $("$REM" note ls --json | jq -r ".notes[] | select(.title == \"Fresh\") | .body") == $'"'"'line\n\nmore'"'"' ]]'
+check "empty editor file cancels add" 'FAKE_NOTE="" "$REM" note add >/dev/null && [[ $("$REM" note ls --json | jq .count) == 5 ]]'
+check "edit via editor" 'FAKE_NOTE=$'"'"'Renamed\n\nnew body'"'"' "$REM" note edit 1 >/dev/null && [[ $("$REM" note show 1) == $'"'"'Renamed\n\nnew body'"'"' ]]'
+check "empty editor file leaves edit unchanged" 'FAKE_NOTE="" "$REM" note edit 1 >/dev/null && [[ $("$REM" note show 1) == $'"'"'Renamed\n\nnew body'"'"' ]]'
+check "editor failure leaves note unchanged" '! EDITOR="$stub/fakeeditor --wrong" "$REM" note edit 1 2>/dev/null && [[ $("$REM" note show 1) == $'"'"'Renamed\n\nnew body'"'"' ]]'
+check "no temp files left after editing" '[[ -z $(ls -A "$XDG_STATE_HOME/rem" | grep -v "^notes.json$") ]]'
+unset EDITOR
+rm -f "$NOTES"
+for i in $(seq 50); do "$REM" note add "n$i" "b" >/dev/null; done
+check "fifty notes fit" '[[ $("$REM" note ls --json | jq .count) == 50 ]]'
+check "fifty-first refused naming cap" '! "$REM" note add "n51" "b" 2>"$tmp/err" && grep -q 50 "$tmp/err"'
+check "items store untouched by notes" '[[ ! -e $XDG_STATE_HOME/rem/items.json ]]'
+
+echo "note refusals"
+echo 'not json' >"$NOTES"
+check "corrupt notes refused, not clobbered" '! "$REM" note ls >/dev/null 2>&1 && [[ $(cat "$NOTES") == "not json" ]]'
+check "corrupt notes leave reminders working" '"$REM" add "still fine" >/dev/null && [[ $("$REM" ls) == *"still fine"* ]]'
+echo '[{"id":1,"title":5,"body":"","created":0,"updated":0}]' >"$NOTES"
+check "wrong note types rejected" '! "$REM" note ls >/dev/null 2>&1'
+head -c $((300 * 1024)) /dev/zero >"$NOTES"
+check "oversized notes store rejected" '! "$REM" note ls >/dev/null 2>&1'
+rm -f "$NOTES"; ln -s /etc/hostname "$NOTES"
+check "symlinked notes store refused" '! "$REM" note ls >/dev/null 2>&1 && ! "$REM" note add t b >/dev/null 2>&1 && [[ -L $NOTES ]]'
+rm -f "$NOTES"; mkfifo "$NOTES"
+check "FIFO notes store refused" '! "$REM" note ls >/dev/null 2>&1'
+rm -f "$NOTES"
+foreign=""
+for f in /etc/hostname /etc/os-release /etc/passwd; do
+  [[ -f $f && $(stat -c %u "$f") != $(id -u) ]] && { foreign=$f; break; }
+done
+if [[ -n $foreign ]] && ln "$foreign" "$NOTES" 2>/dev/null; then
+  check "foreign-owned notes store refused" '! "$REM" note ls >/dev/null 2>&1'
+  rm -f "$NOTES"
+else
+  echo "  skip foreign-owned notes store (cannot hard-link a foreign file here)"
+fi
+rm -f "$NOTES"; touch "$NOTES"; ln "$NOTES" "$tmp/notes-alias"
+check "hard-linked notes store refused" '! "$REM" note ls >/dev/null 2>&1'
+rm -f "$NOTES" "$tmp/notes-alias"
+
+echo "model"
+if command -v node >/dev/null; then
+  check "js model notes" 'node "$here/model.test.js"'
+else
+  echo "  skip js model (no node)"
+fi
+
 echo
 echo "$pass passed, $fail failed"
 ((fail == 0))
