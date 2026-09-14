@@ -32,9 +32,11 @@ Item {
   property string mode: "list"
   property int snoozeTargetId: -1
 
-  // "reminders" or "notes". Always opens on reminders: triage first.
+  // "reminders" or "notes". Always opens on reminders: triage first. The
+  // derived flag must not be called onNotes: QML reads an "on" + capital name
+  // as a signal handler and silently never binds it.
   property string tab: "reminders"
-  readonly property bool onNotes: tab === "notes"
+  readonly property bool notesTab: tab === "notes"
 
   // Anything larger than this from `rem` is treated as garbage rather than
   // handed to JSON.parse. The worst legitimate `ls --json` (500 items of 500
@@ -51,10 +53,10 @@ Item {
 
   property var notes: []
 
-  readonly property bool creating: !onNotes && ReminderFlowModel.isCreateIntent(filterText)
-  readonly property var visibleItems: onNotes ? [] : ReminderFlowModel.visibleItems(items, filterText)
-  readonly property var visibleNotes: onNotes ? ReminderFlowModel.visibleNotes(notes, filterText) : []
-  readonly property int visibleCount: onNotes ? visibleNotes.length : visibleItems.length
+  readonly property bool creating: !notesTab && ReminderFlowModel.isCreateIntent(filterText)
+  readonly property var visibleItems: notesTab ? [] : ReminderFlowModel.visibleItems(items, filterText)
+  readonly property var visibleNotes: notesTab ? ReminderFlowModel.visibleNotes(notes, filterText) : []
+  readonly property int visibleCount: notesTab ? visibleNotes.length : visibleItems.length
   // Typing something no existing item matches is itself a create gesture — it
   // saves an explicit "new item" key and reads naturally. Same on the Notes
   // tab, where the typed text becomes the new note's title.
@@ -74,15 +76,15 @@ Item {
   readonly property int previewHeight: Style.space(20)
   readonly property int footerHeight: Style.space(20)
   readonly property int maxVisibleRows: 10
-  readonly property int listHeight: onNotes
+  readonly property int listHeight: notesTab
     ? maxVisibleRows * rowHeight
     : Math.max(rowHeight, Math.min(visibleItems.length, maxVisibleRows) * rowHeight)
-  readonly property int cardWidth: Style.space(onNotes ? 760 : 460)
+  readonly property int cardWidth: Style.space(notesTab ? 760 : 460)
   readonly property int titleColumnWidth: Style.space(240)
 
   readonly property string promptText: root.mode === "snooze"
     ? "Snooze for… (2h, 3d, tomorrow 9am)"
-    : (root.onNotes ? "Filter notes, or type a title for a new one…" : "Filter, or type a new item…")
+    : (root.notesTab ? "Filter notes, or type a title for a new one…" : "Filter, or type a new item…")
 
   function open(payloadJson) {
     var payload = ({})
@@ -115,7 +117,7 @@ Item {
 
   function reload() {
     root.nowSeconds = Math.floor(Date.now() / 1000)
-    if (root.onNotes) {
+    if (root.notesTab) {
       if (!notesProc.running) notesProc.running = true
     } else if (!listProc.running) {
       listProc.running = true
@@ -123,7 +125,7 @@ Item {
   }
 
   function switchTab() {
-    root.tab = root.onNotes ? "reminders" : "notes"
+    root.tab = root.notesTab ? "reminders" : "notes"
     root.filterText = ""
     root.createPreview = ""
     root.selectedIndex = 0
@@ -171,7 +173,7 @@ Item {
   function setFilter(nextFilter) {
     root.filterText = String(nextFilter).slice(0, root.maxFilterLength)
     root.selectedIndex = 0
-    if (root.mode === "list" && !root.onNotes) previewTimer.restart()
+    if (root.mode === "list" && !root.notesTab) previewTimer.restart()
   }
 
   // Writing a note is the editor's job. The overlay closes, a terminal opens
@@ -245,7 +247,7 @@ Item {
 
   function submit() {
     if (root.mode === "snooze") { root.commitSnooze(); return }
-    if (root.onNotes) {
+    if (root.notesTab) {
       if (root.canCreate) root.createNoteFromFilter()
       else if (root.visibleNotes.length === 0) root.dismiss()
       else root.editSelectedNote()
@@ -358,7 +360,7 @@ Item {
           if (event.key === Qt.Key_Escape) {
             if (root.mode === "snooze") { root.mode = "list"; root.filterText = "" }
             else if (root.filterText) root.setFilter("")
-            else if (root.onNotes) root.switchTab()
+            else if (root.notesTab) root.switchTab()
             else root.dismiss()
             event.accepted = true
           } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
@@ -371,14 +373,14 @@ Item {
             root.selectedIndex = Math.max(root.selectedIndex - 1, 0)
             event.accepted = true
           } else if (ctrl && event.key === Qt.Key_Z) {
-            if (!root.onNotes) root.run(["undo"])
+            if (!root.notesTab) root.run(["undo"])
             event.accepted = true
           } else if (event.key === Qt.Key_Delete) {
-            if (root.onNotes) root.removeSelectedNote()
+            if (root.notesTab) root.removeSelectedNote()
             else root.dropSelected()
             event.accepted = true
           } else if (ctrl && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
-            if (!root.onNotes) root.beginSnooze()
+            if (!root.notesTab) root.beginSnooze()
             event.accepted = true
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             root.submit()
@@ -431,14 +433,14 @@ Item {
             visible: text.length > 0
             text: root.mode === "snooze"
               ? "Enter to snooze, Esc to cancel"
-              : root.onNotes
+              : root.notesTab
                 ? (root.canCreate
                    ? "↳ new note “" + root.filterText.trim() + "” — Enter opens your editor"
                    : (root.notes.length === 0 ? "No notes. Type a title and press Enter." : ""))
                 : (root.canCreate
                    ? "↳ " + (root.createPreview || "…")
                    : (root.items.length === 0 ? "Nothing open. Type to add one." : ""))
-            color: root.onNotes || root.createValid || !root.canCreate ? root.foreground : Color.menu.text
+            color: root.notesTab || root.createValid || !root.canCreate ? root.foreground : Color.menu.text
             textFormat: Text.PlainText
             opacity: 0.62
             font.family: root.fontFamily
@@ -457,7 +459,7 @@ Item {
           // right. Both are plain text; a note titled <b> is titled <b>.
           Item {
             anchors.fill: parent
-            visible: root.onNotes
+            visible: root.notesTab
 
             ListView {
               id: noteList
@@ -534,7 +536,7 @@ Item {
 
           ListView {
             id: resultList
-            visible: !root.onNotes
+            visible: !root.notesTab
             anchors.fill: parent
             model: root.visibleItems
             clip: true
@@ -606,7 +608,7 @@ Item {
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: root.onNotes
+            text: root.notesTab
               ? (root.canCreate
                  ? "Enter  new note    Tab  reminders"
                  : "Enter  edit    Del  remove    Tab  reminders")
